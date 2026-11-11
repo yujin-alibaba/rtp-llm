@@ -338,6 +338,8 @@ class Pipeline(object):
         output_lens = []
         token_lists_to_decode = []
         outputs = generate_outputs.generate_outputs
+        if generate_config.has_rq_supply() and not outputs:
+            return [], [], ouput_tokens_list
         batched = isinstance(outputs, BatchedTerminalOutputs)
         terminal_output = GenerateOutput(finished=True) if batched else None
         if generate_config.has_num_beams():
@@ -587,7 +589,15 @@ class Pipeline(object):
 
         # TODO(xinfei.sxf) add batch and stop test
         async for generate_outputs in backend_stream():
-            if not generate_outputs_cache.generate_outputs:
+            rq_supply = generate_config.has_rq_supply()
+            if rq_supply and not generate_outputs.generate_outputs:
+                yield GenerateResponse(
+                    generate_outputs=generate_outputs, generate_texts=[]
+                )
+                break
+            if (rq_supply and generate_config.has_num_beams()) or (
+                not generate_outputs_cache.generate_outputs
+            ):
                 generate_outputs_cache.generate_outputs = (
                     generate_outputs.generate_outputs
                 )

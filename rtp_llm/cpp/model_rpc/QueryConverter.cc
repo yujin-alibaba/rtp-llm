@@ -48,6 +48,9 @@ std::shared_ptr<GenerateConfig> QueryConverter::transGenerateConfig(const Genera
     generate_config->calculate_loss           = config_proto->calculate_loss();
     generate_config->is_streaming             = config_proto->is_streaming();
     TRANS_OPTIONAL(aux_info);
+    generate_config->ele_rq_ids.assign(config_proto->ele_rq_ids().begin(), config_proto->ele_rq_ids().end());
+    generate_config->ele_rq_ids_pb = config_proto->ele_rq_ids_pb();
+    generate_config->extra_info = config_proto->extra_info();
     generate_config->timeout_ms               = config_proto->timeout_ms();
     generate_config->sp_edit                  = config_proto->sp_edit();
     generate_config->force_disable_sp_run     = config_proto->force_disable_sp_run();

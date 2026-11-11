@@ -67,6 +67,7 @@ cc_test(
     copts = sampler_test_copts,
     deps = test_deps + [
         ":test_utils",
+        "//rtp_llm/cpp/models:logits_processor",
     ] + select({
         "@//:using_cuda13_x86": [":cuda13_torch_nvshmem"],
         "//conditions:default": [],

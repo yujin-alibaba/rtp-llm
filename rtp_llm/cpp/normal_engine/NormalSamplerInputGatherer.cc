@@ -41,13 +41,15 @@ absl::StatusOr<SamplerInputs> NormalSamplerInputGatherer::gather(const StreamGro
         auto sampler_batch_size =
             stream->needTilingForSampling() ? stream->nextBatchSize() : stream->currentBatchSize();
 
+        sampler_inputs.requests.push_back({static_cast<size_t>(sampler_batch_size),
+                                           stream->generateConfig()->hasRqSupply()});
         for (int i = 0; i < sampler_batch_size; ++i) {
             int cur_batch = std::min(i, current_batch_size - 1);
             memcpy(sampler_inputs.token_ids.data_ptr<int32_t>() + ((batch_idx) * (sampler_inputs.step + 1)),
                    complete_token_ids.data_ptr<int32_t>() + cur_batch * complete_seq_len,
                    seq_len * sizeof(int));
             reinterpret_cast<bool*>(sampler_inputs.finished_mask.data_ptr())[batch_idx] =
-                stream->isSubGenerateDoneWithoutLock(i);
+                stream->isSubGenerateDoneWithoutLock(cur_batch);
             batch_idx += 1;
         }
         need_tiling |= stream->needTilingForSampling();
@@ -181,9 +183,12 @@ void NormalSamplerInputGatherer::fillSamplerCommonInputs(SamplerInputs&         
         }
         if (sampler_inputs.cum_log_probs.defined()) {
             const auto& cum_log_probs = stream->cumLogProbs();
-            memcpy(sampler_inputs.cum_log_probs.data_ptr<float>() + batch_idx,
-                   cum_log_probs.data_ptr<float>(),
-                   cum_log_probs.numel() * sizeof(float));
+            auto* scores = sampler_inputs.cum_log_probs.data_ptr<float>() + batch_idx;
+            const auto* previous = cum_log_probs.data_ptr<float>();
+            RTP_LLM_CHECK(cum_log_probs.numel() > 0);
+            for (int i = 0; i < sampler_batch_size; ++i) {
+                scores[i] = previous[std::min<int64_t>(i, cum_log_probs.numel() - 1)];
+            }
         }
         for (int i = 0; i < sampler_batch_size; ++i) {
             input_lengths[batch_idx]      = stream->inputLength();

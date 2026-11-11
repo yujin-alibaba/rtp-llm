@@ -83,6 +83,16 @@ void InferenceParsedRequest::extractRequestGenerateConfigs(RawRequest&          
         } else {
             pr.generate_configs.push_back(std::make_shared<GenerateConfig>());
         }
+        auto& config = *pr.generate_configs.back();
+        if (config.ele_rq_ids.empty()) {
+            config.ele_rq_ids = req.ele_rq_ids;
+        }
+        if (config.ele_rq_ids_pb.empty()) {
+            config.ele_rq_ids_pb = req.ele_rq_ids_pb;
+        }
+        if (config.extra_info.empty()) {
+            config.extra_info = req.extra_info;
+        }
     }
 }
 

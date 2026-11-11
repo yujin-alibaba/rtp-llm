@@ -66,6 +66,9 @@ class RequestExtractor:
         config_values = self.default_generate_config.model_dump()
         config_values.update(nested_config)
         config_values.update(top_level_config)
+        for key in ("ele_rq_ids", "ele_rq_ids_pb", "extra_info"):
+            if nested_config.get(key):
+                config_values[key] = nested_config[key]
 
         def update_optional(key: str, params: List[str]) -> None:
             for source in [remain_config_json, remain_kwargs]:

@@ -146,6 +146,9 @@ message GenerateConfigPB {
     reserved 74;
     // Missing on legacy clients: preserve the engine's historical default true.
     google.protobuf.BoolValue aux_info = 75;
+    repeated string ele_rq_ids = 76;
+    string ele_rq_ids_pb = 77;
+    string extra_info = 78;
 }
 
 message MMPreprocessConfigPB {

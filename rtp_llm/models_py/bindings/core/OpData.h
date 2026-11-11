@@ -293,6 +293,7 @@ struct BeamSearchParams {
     torch::Tensor sequence_lengths;  // [batch_size, num_beams_in]
     torch::Tensor cum_log_probs;     // [batch_size, num_beams_in]
     size_t        num_beams_out = 0;
+    bool          kernel_skip_log_softmax = false;
 };
 
 struct BeamSearchOutput {

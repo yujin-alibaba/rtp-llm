@@ -6,6 +6,7 @@
 #include "rtp_llm/models_py/bindings/core/ExecOps.h"
 #include <algorithm>
 #include <exception>
+#include <limits>
 #include <unordered_set>
 #include "rtp_llm/cpp/utils/ProfilingScope.h"
 
@@ -106,8 +107,6 @@ SamplerOutput Sampler::forward(const SamplerInputs& inputs) {
         return t.defined() ? std::optional<torch::Tensor>(t.narrow(0, offset, size)) : std::nullopt;
     };
 
-    auto processor_errors = preprocessLogits(inputs);
-
     uint64_t max_seq_len   = inputs.token_ids.size(1);
     auto     num_beams_in  = inputs.num_beams_in.data_ptr<int64_t>();
     auto     num_beams_out = inputs.num_beams_out.data_ptr<int64_t>();
@@ -151,7 +150,46 @@ SamplerOutput Sampler::forward(const SamplerInputs& inputs) {
                                      torch::empty({(int64_t)inputs.batch_size_out}, torch::kFloat32) :
                                      inputs.cum_log_probs;
 
-    size_t from_batch_idx_in = 0, to_batch_idx_in = 0;
+    struct Segment {
+        size_t begin;
+        size_t end;
+        bool csr;
+        torch::Tensor full_lse;
+    };
+    std::vector<Segment> segments;
+    auto append_rows = [&](size_t begin, size_t count, bool csr) {
+        RTP_LLM_CHECK(count > 0 && begin + count <= inputs.batch_size);
+        if (!segments.empty() && segments.back().csr == csr
+            && num_beams_in[segments.back().begin] == num_beams_in[begin]
+            && num_beams_out[segments.back().begin] == num_beams_out[begin]) {
+            segments.back().end += count;
+        } else {
+            segments.push_back({begin, begin + count, csr, {}});
+        }
+    };
+    if (inputs.requests.empty()) {
+        for (size_t row = 0; row < inputs.batch_size; ++row) {
+            append_rows(row, 1, false);
+        }
+    } else {
+        size_t row = 0;
+        for (const auto& request : inputs.requests) {
+            append_rows(row, request.count, request.rq_csr);
+            row += request.count;
+        }
+        RTP_LLM_CHECK(row == inputs.batch_size);
+    }
+    for (auto& segment : segments) {
+        if (segment.csr) {
+            segment.full_lse = inputs.logits.narrow(0, segment.begin, segment.end - segment.begin)
+                                   .to(torch::kFloat32).logsumexp(-1, true);
+        }
+    }
+    auto processor_errors = preprocessLogits(inputs);
+    std::unordered_map<size_t, int64_t> effective_widths;
+    // The beam kernel requires populated token IDs for all planned slots. A finite
+    // sentinel lets it fill those slots safely, then we discard them by score.
+    constexpr float masked_beam_score = -1.0e20f;
     size_t from_batch_idx_out      = 0;
     auto&  greedy_sampling_buffers = nextGreedySamplingBuffers(inputs.batch_size);
     struct GreedySamplingBufferGuard {
@@ -170,17 +208,12 @@ SamplerOutput Sampler::forward(const SamplerInputs& inputs) {
         }
     } greedy_sampling_buffer_guard{this};
 
-    while (from_batch_idx_in < inputs.batch_size) {
-        auto cur_num_beams_in  = num_beams_in[from_batch_idx_in];
-        auto cur_num_beams_out = num_beams_out[from_batch_idx_in];
-        ++to_batch_idx_in;
-        while (to_batch_idx_in < inputs.batch_size && num_beams_in[to_batch_idx_in] == cur_num_beams_in
-               && num_beams_out[to_batch_idx_in] == cur_num_beams_out) {
-            ++to_batch_idx_in;
-        }
-
-        // now from_batch_idx to to_batch_idx have the same beam size, sample once.
-        const auto batch_size_in    = to_batch_idx_in - from_batch_idx_in;
+    for (const auto& segment : segments) {
+        const auto from_batch_idx_in = segment.begin;
+        const auto cur_num_beams_in = num_beams_in[from_batch_idx_in];
+        const auto cur_num_beams_out = num_beams_out[from_batch_idx_in];
+        const auto batch_size_in = segment.end - segment.begin;
+        RTP_LLM_CHECK(cur_num_beams_in > 0 && batch_size_in % cur_num_beams_in == 0);
         const auto beam_batch_size  = batch_size_in / cur_num_beams_in;
         const auto batch_size_out   = beam_batch_size * cur_num_beams_out;
         const auto to_batch_idx_out = from_batch_idx_out + batch_size_out;
@@ -193,6 +226,12 @@ SamplerOutput Sampler::forward(const SamplerInputs& inputs) {
         auto sequence_lengths  = inputs.sequence_lengths.narrow(0, from_batch_idx_in, batch_size_in);
         auto cum_log_probs_in  = mayNarrow(inputs.cum_log_probs, from_batch_idx_in, batch_size_in);
         auto cum_log_probs_out = mayNarrow(all_cum_log_probs_out, from_batch_idx_out, batch_size_out);
+
+        torch::Tensor rq_scores;
+        if (segment.csr) {
+            rq_scores = logits.to(torch::kFloat32) - segment.full_lse;
+            rq_scores.masked_fill_(rq_scores.isfinite().logical_not(), -std::numeric_limits<float>::infinity());
+        }
 
         if (cur_num_beams_in == 1 && cur_num_beams_out == 1) {
             const auto decoder_batch_size = (int64_t)inputs.sequence_lengths.size(0);
@@ -229,8 +268,14 @@ SamplerOutput Sampler::forward(const SamplerInputs& inputs) {
             GreedySamplingBuffers* greedy_sampling_buffer_ptr = &greedy_sampling_buffer_slice;
 
             RTP_LLM_PROFILE_SCOPE("sampler.forward.execSampleGreedy");
+            auto sampling_logits = logits;
+            torch::Tensor has_legal_token;
+            if (segment.csr) {
+                has_legal_token = rq_scores.isfinite().any(-1, true);
+                sampling_logits = logits.masked_fill(has_legal_token.logical_not(), 0);
+            }
             auto greedy_output = execSampleGreedy(
-                {logits,
+                {sampling_logits,
                  input_lengths,
                  sequence_lengths_in,
                  token_ids_in,
@@ -240,7 +285,8 @@ SamplerOutput Sampler::forward(const SamplerInputs& inputs) {
                  temperature,
                  repetition_penalty,
                  no_repeat_ngram_size,
-                 cum_log_probs_out.defined() ? std::optional<torch::Tensor>(cum_log_probs_out) : std::nullopt,
+                 cum_log_probs_out.defined() && !segment.csr ?
+                     std::optional<torch::Tensor>(cum_log_probs_out) : std::nullopt,
                  std::nullopt,  // output_log_probs
                  inputs.return_original_all_probs,
                  all_probs,
@@ -253,6 +299,23 @@ SamplerOutput Sampler::forward(const SamplerInputs& inputs) {
                 success.copy_(greedy_output.success);
             } else {
                 success.fill_(true);
+            }
+            if (segment.csr) {
+                auto tokens = token_ids_in.select(1, inputs.step).to(torch::kLong);
+                auto in_range = tokens.ge(0).logical_and(tokens.lt(rq_scores.size(1)));
+                auto selected = rq_scores.gather(1, tokens.clamp(0, rq_scores.size(1) - 1).unsqueeze(1)).squeeze(1);
+                auto valid = in_range.logical_and(selected.isfinite()).logical_and(success);
+                // Empty constraint rows terminate normally. A sampler failure on
+                // a legal row is still reported through the ordinary error path.
+                success.logical_or_(has_legal_token.squeeze(1).logical_not());
+                auto valid_cpu = valid.cpu();
+                const auto* valid_rows = valid_cpu.data_ptr<bool>();
+                for (size_t row = 0; row < batch_size_in; ++row) {
+                    effective_widths.emplace(from_batch_idx_out + row, valid_rows[row] ? 1 : 0);
+                }
+                if (cum_log_probs_out.defined()) {
+                    cum_log_probs_out.add_(selected.to(cum_log_probs_out.device()));
+                }
             }
             // execSampleGreedy updates token_ids_in in place. Mixed beam transitions use a
             // separate output tensor even when the aggregate input/output row counts match.
@@ -290,12 +353,17 @@ SamplerOutput Sampler::forward(const SamplerInputs& inputs) {
             auto sequence_lengths_t = sequence_lengths_reshaped.to(torch::kCUDA);
             auto cum_log_probs_in_t = cum_log_probs_in_reshaped.to(torch::kCUDA);
 
+            if (segment.csr) {
+                logits_t = rq_scores.masked_fill(rq_scores.isfinite().logical_not(), masked_beam_score)
+                               .view_as(logits_t).to(torch::kCUDA);
+            }
             auto output = execSampleBeamSearch({logits_t,
                                                 token_ids_in_t,
                                                 input_lengths_t,
                                                 sequence_lengths_t,
                                                 cum_log_probs_in_t,
-                                                (size_t)cur_num_beams_out});
+                                                (size_t)cur_num_beams_out,
+                                                segment.csr});
 
             auto token_ids_out_reshaped =
                 token_ids_out.reshape({(int64_t)beam_batch_size, (int64_t)cur_num_beams_out, (int64_t)max_seq_len_val});
@@ -310,11 +378,34 @@ SamplerOutput Sampler::forward(const SamplerInputs& inputs) {
             }
             beam_indices.reshape({(int64_t)beam_batch_size, (int64_t)cur_num_beams_out}).copy_(output.beam_indices);
 
+            if (segment.csr) {
+                auto valid_cpu = output.cum_log_probs.gt(masked_beam_score / 2).cpu().contiguous();
+                auto valid = valid_cpu.accessor<bool, 2>();
+                for (size_t request = 0; request < beam_batch_size; ++request) {
+                    std::vector<int64_t> keep;
+                    for (int64_t beam = 0; beam < cur_num_beams_out; ++beam) {
+                        if (valid[request][beam]) {
+                            keep.push_back(beam);
+                        }
+                    }
+                    const auto width = static_cast<int64_t>(keep.size());
+                    const auto offset = from_batch_idx_out + request * cur_num_beams_out;
+                    effective_widths.emplace(offset, width);
+                    if (width > 0 && width < cur_num_beams_out) {
+                        auto indices = torch::tensor(keep, torch::kLong);
+                        token_ids_out_reshaped[request].narrow(0, 0, width).copy_(
+                            output.token_ids[request].index_select(0, indices.to(output.token_ids.device())));
+                        beam_indices.narrow(0, request * cur_num_beams_out, width).copy_(
+                            output.beam_indices[request].index_select(0, indices.to(output.beam_indices.device())));
+                        if (cum_log_probs_out_reshaped.defined()) {
+                            cum_log_probs_out_reshaped[request].narrow(0, 0, width).copy_(
+                                output.cum_log_probs[request].index_select(0, indices.to(output.cum_log_probs.device())));
+                        }
+                    }
+                }
+            }
             success.fill_(true);
         }
-
-        // prepare for next sampling
-        from_batch_idx_in  = to_batch_idx_in;
         from_batch_idx_out = to_batch_idx_out;
     }
 
@@ -323,7 +414,8 @@ SamplerOutput Sampler::forward(const SamplerInputs& inputs) {
                           std::move(inputs.all_probs),
                           std::move(all_beam_indices),
                           std::move(all_success),
-                          std::move(processor_errors)});
+                          std::move(processor_errors),
+                          std::move(effective_widths)});
 }
 
 std::vector<std::optional<ErrorInfo>> Sampler::preprocessLogits(const SamplerInputs& inputs) {

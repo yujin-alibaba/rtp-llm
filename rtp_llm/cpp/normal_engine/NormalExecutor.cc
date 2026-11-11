@@ -637,6 +637,11 @@ void NormalExecutor::publishNormalDeviceState(const StreamGroups& stream_groups,
 
     int64_t batch_idx_out = 0;
     for (auto& stream : all_streams) {
+        if (sampler_output.effectiveWidth(batch_idx_out, 1) == 0) {
+            stream->setNormalAsyncDeviceState(GenerateStream::NormalAsyncDeviceState{});
+            ++batch_idx_out;
+            continue;
+        }
         torch::Tensor last_sample_token_gpu;
         if (token_ids_gpu.dim() == 1) {
             last_sample_token_gpu = token_ids_gpu.narrow(0, batch_idx_out, 1).to(torch::kInt32);
@@ -687,6 +692,9 @@ absl::Status NormalExecutor::dispatchOutputAsync(const StreamGroups&           s
         publishNormalDeviceState(stream_groups, sampler_output);
     }
 
+    const bool has_empty_rq_result = std::any_of(sampler_output.effective_widths.begin(),
+                                                 sampler_output.effective_widths.end(),
+                                                 [](const auto& item) { return item.second == 0; });
     auto* processor           = batch_stream_processor_.get();
     auto  stream_groups_copy  = stream_groups;
     auto  model_output_copy   = std::move(model_output);
@@ -729,6 +737,12 @@ absl::Status NormalExecutor::dispatchOutputAsync(const StreamGroups&           s
         }
         // dec_guard destructs here, dec'ing each stream's pending count.
     });
+
+    if (has_empty_rq_result) {
+        // No next device token exists for these requests. Resolve termination
+        // before the next scheduling pass can select their old host rows.
+        dispatch_runner_.sync(cuda_graph::graphGetCurrentStream());
+    }
 
     // Kineto requires profiler enable/disable on the same thread. Keep finish
     // on the engine loop thread even when output dispatch runs asynchronously.

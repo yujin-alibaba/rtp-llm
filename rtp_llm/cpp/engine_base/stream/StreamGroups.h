@@ -207,12 +207,12 @@ public:
     bool needReturnCumLogProbs() const {
         // beam kernel need cum log probs input, tmp set true
         for (auto& stream : context_streams_) {
-            if (stream->returnCumLogProbs() || stream->hasNumBeams()) {
+            if (stream->returnCumLogProbs() || stream->hasNumBeams() || stream->generateConfig()->hasRqSupply()) {
                 return true;
             }
         }
         for (auto& stream : decode_streams_) {
-            if (stream->returnCumLogProbs() || stream->hasNumBeams()) {
+            if (stream->returnCumLogProbs() || stream->hasNumBeams() || stream->generateConfig()->hasRqSupply()) {
                 return true;
             }
         }

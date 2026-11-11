@@ -158,7 +158,11 @@ GenerateOutputs NormalGenerateStream::materializeTerminalOutput(GenerateOutputs 
 
 GenerateOutputs NormalGenerateStream::prepareGenerateOutput(const StreamUpdateInfo& update_info) {
     RTP_LLM_PROFILE_SCOPE("output.build_generate_output");
-    size_t          output_len = seqLength() - last_output_pos_;
+    // A streaming beam can have a different parent from the previous frame.
+    // Return its complete generated prefix for the beam detokenizer.
+    const auto output_start = generateConfig()->hasRqSupply() && hasNumBeams() && isStreaming() ?
+                                  inputLength() : last_output_pos_;
+    const auto output_len = seqLength() - output_start;
     GenerateOutputs generate_results;
     generate_results.request_id = request_id_;
     torch::Tensor all_hidden_states_cpu;
@@ -172,7 +176,7 @@ GenerateOutputs NormalGenerateStream::prepareGenerateOutput(const StreamUpdateIn
 
         // TODO(xinfei.sxf) optimize this copy : only copy last token
         complete_token_ids_->copyTokensTo(
-            i, generate_output.output_ids.data_ptr<int32_t>(), last_output_pos_, output_len);
+            i, generate_output.output_ids.data_ptr<int32_t>(), output_start, output_len);
         if (returnLogits() && update_info.logits.defined()) {
             torch::Tensor logits_result;
             const auto&   select_tokens_id = generate_input_->generate_config->select_tokens_id;
@@ -248,7 +252,7 @@ GenerateOutputs NormalGenerateStream::prepareGenerateOutput(const StreamUpdateIn
             generate_output.aux_info.prefix_len               = generate_input_->prefix_length;
             // TODO(xinfei.sxf) 提前结束的query，output len要设置正确
             generate_output.aux_info.output_len       = seqLength() - generate_input_->inputLength();
-            generate_output.aux_info.step_output_len  = output_len;
+            generate_output.aux_info.step_output_len  = seqLength() - last_output_pos_;
             generate_output.aux_info.reuse_len        = initial_reuse_length_;
             generate_output.aux_info.pd_sep           = queryPdSep();
             generate_output.aux_info.local_reuse_len  = local_reuse_length_;
@@ -259,7 +263,7 @@ GenerateOutputs NormalGenerateStream::prepareGenerateOutput(const StreamUpdateIn
 
             if (calculateSoftmaxProbs() && softmax_probs_.defined()) {
                 generate_output.aux_info.softmax_probs =
-                    softmax_probs_[i].narrow(0, last_output_pos_, output_len).clone();
+                    softmax_probs_[i].narrow(0, output_start, output_len).clone();
             }
             if (update_info.cum_log_probs.defined()) {
                 generate_output.aux_info.cum_log_probs = cum_log_probs_.narrow(0, i, 1).cpu().clone();
@@ -310,6 +314,15 @@ void NormalGenerateStream::enqueueGenerateOutput(GenerateOutputs&& generate_resu
 void NormalGenerateStream::updateOutput(const StreamUpdateInfo& update_info) {
     RTP_LLM_PROFILE_SCOPE("output.update_result");
     RTP_LLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    if (update_info.rq_no_candidates) {
+        finished_ = true;
+        fillSubGenerateStatus(StreamState::FINISHED);
+        GenerateOutputs empty;
+        empty.request_id = request_id_;
+        enqueueGenerateOutput(std::move(empty));
+        reportEventWithoutLock(StreamEvents::GenerateDone);
+        return;
+    }
     // TODO(xinfei.sxf) consider the case of pd-sep first token finished.
 
     if (update_info.loss.defined()) {

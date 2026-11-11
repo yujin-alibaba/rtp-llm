@@ -214,6 +214,26 @@ TEST_F(QueryConverterTest, AuxInfoRpcRoundTripPreservesOutputsAndLegacyDefault) 
     }
 }
 
+TEST_F(QueryConverterTest, TransGenerateConfigPreservesRqSupplyAndAuxPresence) {
+    for (const auto aux : {std::optional<bool>{}, std::optional<bool>{false}, std::optional<bool>{true}}) {
+        GenerateConfigPB wire;
+        wire.add_ele_rq_ids("1_2_3");
+        wire.set_ele_rq_ids_pb("packed");
+        wire.set_extra_info("flat");
+        if (aux.has_value()) {
+            wire.mutable_aux_info()->set_value(*aux);
+        }
+        GenerateConfigPB parsed;
+        ASSERT_TRUE(parsed.ParseFromString(wire.SerializeAsString()));
+        EXPECT_EQ(parsed.has_aux_info(), aux.has_value());
+        const auto config = QueryConverter::transGenerateConfig(&parsed);
+        EXPECT_EQ(config->ele_rq_ids, std::vector<std::string>{"1_2_3"});
+        EXPECT_EQ(config->ele_rq_ids_pb, "packed");
+        EXPECT_EQ(config->extra_info, "flat");
+        EXPECT_EQ(config->aux_info, aux.value_or(true));
+    }
+}
+
 TEST_F(QueryConverterTest, TransGenerateConfigResolvesThinkingState) {
     using Case = std::tuple<GenerateConfigPB::ThinkingModePB, bool, ThinkingMode, bool>;
     const std::array<Case, 5> cases{{

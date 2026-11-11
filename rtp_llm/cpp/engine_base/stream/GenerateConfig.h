@@ -97,6 +97,13 @@ public:
     ReturnAllProbsMode            return_all_probs         = ReturnAllProbsMode::NONE;
     bool                          return_softmax_probs     = false;
     bool                          aux_info                 = true;
+    std::vector<std::string> ele_rq_ids;
+    std::string ele_rq_ids_pb;
+    std::string extra_info;
+
+    bool hasRqSupply() const {
+        return !ele_rq_ids.empty() || !ele_rq_ids_pb.empty() || !extra_info.empty();
+    }
     std::vector<std::vector<int>> stop_words_list;
     std::vector<std::string>      stop_words_str;
     bool                          print_stop_words = false;
@@ -331,6 +338,9 @@ public:
         JSONIZE(enable_remote_cache);
         JSONIZE(force_batch);
         JSONIZE(aux_info);
+        JSONIZE(ele_rq_ids);
+        JSONIZE(ele_rq_ids_pb);
+        JSONIZE(extra_info);
         JSONIZE_OPTIONAL(batch_group_timeout);
         JSONIZE(unique_key);
         JSONIZE(combo_token_size);

@@ -259,7 +259,7 @@ void CompleteTokenIds::setSeqLength(int seq_length) {
     }
     seq_length_ = seq_length;
 
-    if (batch_size_ == 1) {  // reset common len
+    if (max_batch_size_ == 1) {  // reset common len only for permanently single-row histories
         common_len_ = seq_length_;
     }
 }

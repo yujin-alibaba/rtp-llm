@@ -35,8 +35,16 @@ std::pair<MultiSeqsResponse, bool> GenerateStreamWrapper::generateResponse() {
     }
     auto outputs = result.value();
 
-    if (outputs_cache_.generate_outputs.size() == 0) {
-        outputs_cache_.generate_outputs = outputs.generate_outputs;
+    if (generate_config_->hasRqSupply() && outputs.generate_outputs.empty()) {
+        MultiSeqsResponse response;
+        response.finished = true;
+        return {std::move(response), false};
+    }
+    if (outputs_cache_.generate_outputs.empty() || (generate_config_->hasRqSupply() && generate_config_->hasNumBeams())) {
+        if (outputs_cache_.generate_outputs.size() != outputs.generate_outputs.size()) {
+            token_processor_ctx_.reset();
+        }
+        outputs_cache_.generate_outputs = std::move(outputs.generate_outputs);
     } else {
         for (int i = 0; i < outputs_cache_.generate_outputs.size(); i++) {
             if (outputs_cache_.generate_outputs[i].finished == false) {

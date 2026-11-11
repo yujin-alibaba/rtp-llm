@@ -147,6 +147,52 @@ TEST_F(NormalEngineTest, testParallelDispatchMultipleRequests) {
     EXPECT_TRUE(thread_pool.expired());
 }
 
+// Run this test in separate processes with RTP_LLM_DEVICE_INPUT=1 and
+// RTP_LLM_STREAM_ASYNC=0/1 to exercise both publisher callers.
+TEST_F(NormalEngineTest, RqEmptyDecodeClearsSnapshotAndPreservesNeighborRows) {
+    auto engine = createMockEngine(CustomConfig{});
+    auto make_query = [](int prompt) {
+        auto input = std::make_shared<GenerateInput>();
+        input->input_ids = torch::tensor({prompt}, torch::kInt32);
+        input->generate_config = std::make_shared<GenerateConfig>();
+        input->generate_config->max_new_tokens = 3;
+        input->generate_config->top_k = 1;
+        input->generate_config->is_streaming = false;
+        return input;
+    };
+    auto rq = make_query(2);
+    rq->generate_config->is_streaming = true;
+    // The mock vocabulary has 100 entries. The first decode step can use 5;
+    // its next CSR row has no in-vocabulary continuation.
+    rq->generate_config->ele_rq_ids = {"5_120_8"};
+    auto streams = engine->batchEnqueue({make_query(1), rq, make_query(3)});
+    ASSERT_EQ(streams.size(), 3);
+
+    const auto first = streams[1]->nextOutput(5000);
+    ASSERT_TRUE(first.ok()) << first.status().ToString();
+    ASSERT_EQ(first.value().generate_outputs.size(), 1);
+    EXPECT_EQ(first.value().generate_outputs[0].output_ids.item<int32_t>(), 5);
+    const auto empty = streams[1]->nextOutput(5000);
+    ASSERT_TRUE(empty.ok()) << empty.status().ToString();
+    EXPECT_TRUE(empty.value().generate_outputs.empty());
+    EXPECT_EQ(streams[1]->seqLength(), 2);
+    const auto& state = streams[1]->getNormalAsyncDeviceState();
+    EXPECT_FALSE(state.last_sample_token_gpu.defined());
+    EXPECT_FALSE(state.next_seq_len_gpu.defined());
+    EXPECT_LT(state.next_real_seq_len, 0);
+
+    for (const size_t neighbor : {0, 2}) {
+        const auto result = streams[neighbor]->nextOutput(5000);
+        ASSERT_TRUE(result.ok()) << result.status().ToString();
+        ASSERT_EQ(result.value().generate_outputs.size(), 1);
+        const auto& output = result.value().generate_outputs[0];
+        EXPECT_EQ(output.output_ids.numel(), 3);
+        EXPECT_EQ(streams[neighbor]->seqLength(), 4);
+        EXPECT_TRUE(torch::equal(output.output_ids.flatten(),
+                                streams[neighbor]->completeTokenIds()[0].slice(0, 1, 4)));
+    }
+}
+
 TEST_F(NormalEngineTest, testSystemPrompt) {
     CustomConfig config;
     vector<int>  prompt_1           = {1, 2, 3};

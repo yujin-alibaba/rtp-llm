@@ -222,6 +222,9 @@ class GenerateConfig(BaseModel):
     return_all_probs: int = ReturnAllProbsMode.NONE
     return_softmax_probs: bool = False
     aux_info: bool = True
+    ele_rq_ids: List[str] = Field(default_factory=list)
+    ele_rq_ids_pb: str = ""
+    extra_info: str = ""
     can_use_pd_separation: bool = True
     gen_timeline: bool = False
     profile_step: int = 3
@@ -476,6 +479,9 @@ class GenerateConfig(BaseModel):
             if len(self.variable_num_beams) == 0
             else max(self.variable_num_beams)
         )
+
+    def has_rq_supply(self) -> bool:
+        return bool(self.ele_rq_ids or self.ele_rq_ids_pb or self.extra_info)
 
     def has_num_beams(self):
         return self.max_num_beams() > 1

@@ -604,7 +604,10 @@ grpc::Status PrefillRpcServer::GenerateStreamCall(grpc::ServerContext*          
     auto pd_separation = request->generate_config().max_new_tokens() > 1 && request->generate_config().num_beams() <= 1
                          && request->generate_config().variable_num_beams().size() == 0
                          && request->generate_config().num_return_sequences() <= 1
-                         && request->generate_config().can_use_pd_separation();
+                         && request->generate_config().can_use_pd_separation()
+                         && request->generate_config().ele_rq_ids().empty()
+                         && request->generate_config().ele_rq_ids_pb().empty()
+                         && request->generate_config().extra_info().empty();
     if (!pd_separation) {
         return LocalRpcServer::GenerateStreamCall(server_context, request, writer);
     }

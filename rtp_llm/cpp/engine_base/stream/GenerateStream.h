@@ -46,6 +46,7 @@ struct StreamUpdateInfo {
     // prompt scoring
     std::optional<PromptLogitsOutput> prompt_logits;
     std::optional<ErrorInfo>          error_info;
+    bool                              rq_no_candidates = false;
 };
 
 struct StreamSpecUpdateInfo {
@@ -404,7 +405,7 @@ public:
     }
 
     bool forceDisableSpRun() const {
-        return generate_input_->generate_config->force_disable_sp_run;
+        return generateConfig()->force_disable_sp_run || generateConfig()->hasRqSupply();
     }
 
     bool disableSpRun() const {
@@ -813,6 +814,7 @@ protected:
     bool need_release_resource_ = true;
 
     ReturnAllProbsMode return_all_probs_ = ReturnAllProbsMode::NONE;
+
 
     bool last_block_aligned_ = false;
 

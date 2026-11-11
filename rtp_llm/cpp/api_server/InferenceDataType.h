@@ -67,6 +67,9 @@ public:
         }
 
         JSONIZE_OPTIONAL(generate_config);
+        json.Jsonize("ele_rq_ids", ele_rq_ids, {});
+        json.Jsonize("ele_rq_ids_pb", ele_rq_ids_pb, {});
+        json.Jsonize("extra_info", extra_info, {});
     }
     std::string                                          source;
     bool                                                 private_request;
@@ -76,6 +79,9 @@ public:
     std::optional<std::vector<std::vector<std::string>>> images_batch;
     std::optional<std::vector<std::string>>              images;
     std::optional<GenerateConfig>                        generate_config;
+    std::vector<std::string>                             ele_rq_ids;
+    std::string                                          ele_rq_ids_pb;
+    std::string                                          extra_info;
 };
 
 class AuxInfoAdapter: public Jsonizable, public AuxInfo {

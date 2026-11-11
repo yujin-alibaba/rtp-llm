@@ -15,6 +15,7 @@
 #include "rtp_llm/cpp/models/logits_processor/PrefixToCandidateTokens.h"
 #include "rtp_llm/cpp/models/logits_processor/RecommendationLogitsProcessor.h"
 #include "rtp_llm/cpp/models/logits_processor/TreeLogitsProcessor.h"
+#include "rtp_llm/cpp/models/logits_processor/RqCsrLogitsProcessor.h"
 #include "rtp_llm/cpp/utils/ErrorCode.h"
 #include "rtp_llm/cpp/utils/Logger.h"
 
@@ -77,6 +78,7 @@ void LogitsProcessorFactory::init(const ModelConfig&   model_config,
                                   const GrammarConfig& grammar_config,
                                   const std::string&   tree_decode_config) {
     grammarBackend() = XGrammarBackend::create(grammar_config.tokenizer_info_json, grammar_config);
+    RqCsrLogitsProcessor::loadTokenBases(model_config.ckpt_path);
     PrefixToCandidateTokens::instance()->reloadPrefixDictWithPrefix(model_config.ckpt_path, tree_decode_config);
 }
 
@@ -138,6 +140,16 @@ LogitsProcessorFactory::createLogitsProcessors(std::shared_ptr<GenerateInput> ge
         result.push_back(std::move(multi_seq_processor));
     }
 
+    if (config.hasRqSupply()) {
+        if (!config.hasNumBeams() && config.num_return_sequences > 1) {
+            return ErrorInfo(ErrorCode::INVALID_PARAMS, "RQ supply requires beam search or one return sequence");
+        }
+        auto csr = RqCsrLogitsProcessor::create(config);
+        if (!csr.ok()) {
+            return csr.status();
+        }
+        result.push_back(std::move(csr.value()));
+    }
     return std::move(result);
 }
 

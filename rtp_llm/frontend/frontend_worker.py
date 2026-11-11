@@ -155,6 +155,9 @@ class FrontendWorker:
         )
         pipeline_responses = []
         for gen_response in responses:
+            if gc.has_rq_supply() and not gen_response.generate_outputs.generate_outputs:
+                pipeline_responses.append(self._empty_rq_response(gc))
+                continue
             out = gen_response.generate_outputs.generate_outputs[0]
             generate_texts = gen_response.generate_texts
             aux_info_dict: Dict[str, Any] = {}
@@ -256,10 +259,22 @@ class FrontendWorker:
                 **kwargs,
             )
 
+    @staticmethod
+    def _empty_rq_response(generate_config: GenerateConfig) -> PipelineResponse:
+        return PipelineResponse(
+            response="",
+            finished=True,
+            aux_info={"beam_responses": []}
+            if generate_config.aux_info and generate_config.has_num_beams()
+            else {},
+        )
+
     def _format_response(
         self, gen_responses: GenerateResponse, generate_config: GenerateConfig
     ) -> Dict[str, Any]:
         generate_texts = gen_responses.generate_texts
+        if generate_config.has_rq_supply() and not gen_responses.generate_outputs.generate_outputs:
+            return self._empty_rq_response(generate_config)
         finished = gen_responses.generate_outputs.generate_outputs[0].finished
         if generate_config.aux_info:
             aux_info = gen_responses.generate_outputs.generate_outputs[0].aux_info

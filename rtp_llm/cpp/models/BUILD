@@ -55,6 +55,7 @@ cc_library(
         "logits_processor/SpecLogitsVerifyRunner.h",
         "logits_processor/ThinkModeLogitsProcessor.h",
         "logits_processor/TreeLogitsProcessor.h",
+        "logits_processor/RqCsrLogitsProcessor.h",
         "logits_processor/RecommendationLogitsProcessor.h",
         "logits_processor/LogitsProcessorFactory.h",
         "logits_processor/GrammarLogitsProcessor.h",
@@ -68,6 +69,7 @@ cc_library(
         "logits_processor/SpecLogitsVerifyRunner.cc",
         "logits_processor/ThinkModeLogitsProcessor.cc",
         "logits_processor/TreeLogitsProcessor.cc",
+        "logits_processor/RqCsrLogitsProcessor.cc",
         "logits_processor/RecommendationLogitsProcessor.cc",
         "logits_processor/LogitsProcessorFactory.cc",
         "logits_processor/GrammarLogitsProcessor.cc",
@@ -88,6 +90,8 @@ cc_library(
         "//rtp_llm/cpp/utils:profiling_scope",
         "//rtp_llm/models_py/bindings/core:exec_ops_hdr",
         "@havenask//aios/autil:json",
+        "@com_google_absl//absl/strings",
+        "@rapidjson//:rapidjson",
     ] + select({
         "//:using_cuda": [
             "//rtp_llm/models_py/bindings/cuda/ops:standalone_ops",

@@ -91,7 +91,9 @@ BeamSearchOutput sampleBeamSearch(BeamSearchParams params) {
     // compute log softmax for probability calculation
     // note the computation here is intentionally performed inplace to reduce memory usage
     at::Tensor log_softmax_logits_tsr = params.logits;
-    at::log_softmax_out(log_softmax_logits_tsr, params.logits, -1);
+    if (!params.kernel_skip_log_softmax) {
+        at::log_softmax_out(log_softmax_logits_tsr, params.logits, -1);
+    }
 
     // beam search heuristic
     auto                           logits_dtype = torchDTypeToDataType(params.logits.dtype());

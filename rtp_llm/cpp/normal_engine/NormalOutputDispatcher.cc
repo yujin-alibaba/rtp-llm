@@ -124,8 +124,10 @@ absl::Status NormalOutputDispatcher::dispatch(const StreamGroups& stream_groups,
     const size_t total_batch_size_out = stream_groups.totalSamplerBatchSizeOut();
     RTP_LLM_CHECK(total_batch_size_out == (size_t)sampler_output.token_ids.size(0));
     int  batch_idx_in     = 0;
+    int  sampler_idx_in   = 0;
     int  batch_idx_out    = 0;
     int  token_offset     = 0;
+    int  new_token_offset = 0;
     bool return_all_probs = stream_groups.needReturnAllProbs() != ReturnAllProbsMode::NONE;
 
     // Select only each stream's newly generated token on-device, so beam search
@@ -138,11 +140,16 @@ absl::Status NormalOutputDispatcher::dispatch(const StreamGroups& stream_groups,
         const int64_t token_position =
             has_beam_search ? static_cast<int64_t>(stream->seqLength()) : sampler_output.token_ids.size(1) - 1;
         RTP_LLM_CHECK(token_position < sampler_output.token_ids.size(1));
-        new_token_views.emplace_back(
-            sampler_output.token_ids.narrow(0, batch_idx_out, next_batch_size).select(1, token_position).unsqueeze(1));
+        const auto width = sampler_output.effectiveWidth(batch_idx_out, next_batch_size);
+        RTP_LLM_CHECK(width >= 0 && width <= next_batch_size);
+        if (width > 0) {
+            new_token_views.emplace_back(
+                sampler_output.token_ids.narrow(0, batch_idx_out, width).select(1, token_position).unsqueeze(1));
+        }
         batch_idx_out += next_batch_size;
     }
-    const torch::Tensor new_tokens_for_copy = torch::cat(new_token_views, 0).contiguous();
+    const torch::Tensor new_tokens_for_copy = new_token_views.empty() ?
+        torch::empty({0, 1}, torch::kInt32) : torch::cat(new_token_views, 0).contiguous();
 
     bool                need_d2h_sync  = false;
     const torch::Tensor new_tokens_all = copyToPinnedCpuAsync(new_tokens_for_copy, need_d2h_sync);
@@ -161,16 +168,23 @@ absl::Status NormalOutputDispatcher::dispatch(const StreamGroups& stream_groups,
         auto cur_batch_size  = stream->currentBatchSize();
         auto next_batch_size = stream->nextBatchSize();
         auto token_size      = stream->currentExecuteTokenSize();
+        const int sampler_rows = stream->needTilingForSampling() ? next_batch_size : cur_batch_size;
 
-        auto task = [&, stream, batch_idx_in, batch_idx_out, token_offset, dispatch_stream]() {
+        const auto width = sampler_output.effectiveWidth(batch_idx_out, next_batch_size);
+        auto task = [&, stream, batch_idx_in, sampler_idx_in, sampler_rows, batch_idx_out, token_offset,
+                     new_token_offset, width, dispatch_stream]() {
             c10::InferenceMode           inference_guard(true);
             cuda_graph::GraphStreamGuard stream_guard(dispatch_stream);
             try {
                 dispatchSingleStream(stream,
                                      merge_outputs,
                                      batch_idx_in,
+                                     sampler_idx_in,
+                                     sampler_rows,
                                      batch_idx_out,
                                      token_offset,
+                                     new_token_offset,
+                                     width,
                                      return_all_probs,
                                      new_tokens_all,
                                      success_cpu);
@@ -188,7 +202,9 @@ absl::Status NormalOutputDispatcher::dispatch(const StreamGroups& stream_groups,
         }
 
         batch_idx_in += cur_batch_size;
+        sampler_idx_in += sampler_rows;
         batch_idx_out += next_batch_size;
+        new_token_offset += width;
         token_offset += token_size;
     }
 
@@ -212,8 +228,12 @@ absl::Status NormalOutputDispatcher::dispatch(const StreamGroups& stream_groups,
 void NormalOutputDispatcher::dispatchSingleStream(GenerateStreamPtr    stream,
                                                   const MergedOutput&  merge_outputs,
                                                   int                  batch_idx_in,
+                                                  int                  sampler_idx_in,
+                                                  int                  sampler_rows,
                                                   int                  batch_idx_out,
                                                   int                  token_offset,
+                                                  int                  new_token_offset,
+                                                  int                  next_batch_size,
                                                   bool                 return_all_probs,
                                                   const torch::Tensor& new_tokens_all,
                                                   const torch::Tensor& success_cpu) const {
@@ -225,12 +245,27 @@ void NormalOutputDispatcher::dispatchSingleStream(GenerateStreamPtr    stream,
     const auto&  sampler_output = merge_outputs.sampler_output;
     const size_t token_stride   = new_tokens_all.size(1);
 
-    auto cur_batch_size  = stream->currentBatchSize();
-    auto next_batch_size = stream->nextBatchSize();
-    auto token_size      = stream->currentExecuteTokenSize();
+    auto cur_batch_size = stream->currentBatchSize();
+    auto token_size = stream->currentExecuteTokenSize();
+    auto error_info = collectStreamSamplerError(sampler_output, success_cpu, sampler_idx_in, sampler_rows);
+    if (next_batch_size == 0) {
+        stream->update({.new_tokens = {},
+                        .num_new_tokens = 0,
+                        .hidden_states = {},
+                        .logits = {},
+                        .softmax_probs = {},
+                        .cum_log_probs = {},
+                        .all_probs = {},
+                        .loss = {},
+                        .src_batch_indices = {},
+                        .all_hidden_states = {},
+                        .error_info = std::move(error_info),
+                        .rq_no_candidates = true});
+        return;
+    }
 
     bool has_beam_search = stream->usesBeamSearchTokenLayoutForCurrentStep();
-    bool has_var_batch   = stream->currentBatchSize() != stream->nextBatchSize();
+    bool has_var_batch   = cur_batch_size != next_batch_size;
 
     // construct mapping from output batches to input batches
     torch::Tensor src_batch_indices;
@@ -294,7 +329,10 @@ void NormalOutputDispatcher::dispatchSingleStream(GenerateStreamPtr    stream,
 
     torch::Tensor all_probs;
     if (return_all_probs) {
-        all_probs = sampler_output.all_probs.narrow(0, batch_idx_out, next_batch_size);
+        const auto input_probs = sampler_output.all_probs.narrow(0, sampler_idx_in, sampler_rows);
+        all_probs = has_beam_search ?
+            input_probs.index_select(0, src_batch_indices.to(input_probs.device(), torch::kLong)) :
+            input_probs.narrow(0, 0, next_batch_size);
     };
 
     torch::Tensor batch_cum_log_probs;
@@ -372,7 +410,7 @@ void NormalOutputDispatcher::dispatchSingleStream(GenerateStreamPtr    stream,
         all_hidden_states = model_output.all_hidden_states.narrow(0, token_offset, token_size);
     }
 
-    auto new_tokens = new_tokens_all.narrow(0, batch_idx_out, next_batch_size);
+    auto new_tokens = new_tokens_all.narrow(0, new_token_offset, next_batch_size);
 
     torch::Tensor current_softmax_result;
     if (stream->calculateSoftmaxProbs()) {
@@ -389,10 +427,9 @@ void NormalOutputDispatcher::dispatchSingleStream(GenerateStreamPtr    stream,
         }
     }
 
-    auto error_info = collectStreamSamplerError(sampler_output, success_cpu, batch_idx_in, cur_batch_size);
     if (asyncDebugEnabled() && success_cpu.defined()) {
-        for (int i = 0; i < cur_batch_size; ++i) {
-            if (!(success_cpu.data_ptr<bool>()[batch_idx_in + i])) {
+        for (int i = 0; i < sampler_rows; ++i) {
+            if (!(success_cpu.data_ptr<bool>()[sampler_idx_in + i])) {
                 const auto& state = stream->getNormalAsyncDeviceState();
                 RTP_LLM_LOG_ERROR("[async-debug] sampler success=false: stream=%ld pd_sep=%d status=%s "
                                   "pending=%d seq_len=%d state_next_real=%d batch_idx_in=%d token_stride=%zu",

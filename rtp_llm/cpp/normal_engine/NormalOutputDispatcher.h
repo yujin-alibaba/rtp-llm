@@ -35,8 +35,12 @@ private:
     void dispatchSingleStream(GenerateStreamPtr    stream,
                               const MergedOutput&  merge_outputs,
                               int                  batch_idx_in,
+                              int                  sampler_idx_in,
+                              int                  sampler_rows,
                               int                  batch_idx_out,
                               int                  token_offset,
+                              int                  new_token_offset,
+                              int                  next_batch_size,
                               bool                 return_all_probs,
                               const torch::Tensor& new_tokens_all,
                               const torch::Tensor& success_cpu) const;

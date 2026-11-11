@@ -358,7 +358,7 @@ int GenerateStream::batchSize(int output_len) const {
 }
 
 int GenerateStream::currentBatchSize() const {
-    return batchSize(outputTokenLen());
+    return generateConfig()->hasRqSupply() ? complete_token_ids_->batchSize() : batchSize(outputTokenLen());
 }
 
 int GenerateStream::nextBatchSize() const {
@@ -389,7 +389,7 @@ int GenerateStream::numBeams(int output_length) const {
 }
 
 int GenerateStream::currentNumBeams() const {
-    return numBeams(outputTokenLen());
+    return generateConfig()->hasRqSupply() ? currentBatchSize() : numBeams(outputTokenLen());
 }
 
 int GenerateStream::nextNumBeams() const {
@@ -1113,6 +1113,13 @@ void GenerateStream::update(const StreamUpdateInfo& update_info) {
         return;
     }
 
+    if (update_info.rq_no_candidates) {
+        // The request finished without a candidate. Do not append history,
+        // advance processors, or reorder KV using the planned slots.
+        updateOutput(update_info);
+        return;
+    }
+
     const auto& new_tokens     = update_info.new_tokens;
     auto        num_new_tokens = update_info.num_new_tokens;
 
@@ -1136,6 +1143,7 @@ void GenerateStream::update(const StreamUpdateInfo& update_info) {
             return;
         }
     }
+
 
     resizeSubGenerateStatus(update_info.new_tokens.size(0));
 
@@ -1441,6 +1449,7 @@ void GenerateStream::CopyOnWrite(const GenerateStream& other_stream, bool copy_l
     grpc_normal_device_state_pending_ =
         std::make_shared<std::atomic<bool>>(other_stream.hasGrpcNormalDeviceStatePending());
     cum_log_probs_ = other_stream.cum_log_probs_.clone();
+
     if (other_stream.calculateLoss() && copy_loss) {
         loss_ = other_stream.loss_.clone();
     } else {

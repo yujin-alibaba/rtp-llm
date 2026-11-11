@@ -1,6 +1,7 @@
 #pragma once
 
 #include <optional>
+#include <unordered_map>
 #include <vector>
 #include <torch/all.h>
 #include "rtp_llm/models_py/bindings/core/Types.h"
@@ -66,6 +67,11 @@ public:
     mutable torch::Tensor all_probs;      // shape: [batch_size, vocab_size]
 
     std::vector<at::Generator> generator;
+    struct RequestRows {
+        size_t count;
+        bool rq_csr;
+    };
+    std::vector<RequestRows> requests;
 };
 
 struct SamplerOutput {
@@ -76,6 +82,13 @@ public:
     torch::Tensor                         beam_index;
     torch::Tensor                         success;
     std::vector<std::optional<ErrorInfo>> processor_errors;
+    // Host-readable widths keyed by the first planned output slot.
+    std::unordered_map<size_t, int64_t> effective_widths;
+
+    int64_t effectiveWidth(size_t offset, int64_t planned) const {
+        const auto width = effective_widths.find(offset);
+        return width == effective_widths.end() ? planned : width->second;
+    }
 };
 
 struct MergedOutput {

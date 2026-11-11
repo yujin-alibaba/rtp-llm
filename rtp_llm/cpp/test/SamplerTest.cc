@@ -1,5 +1,6 @@
 #include "rtp_llm/cpp/testing/TestBase.h"
 #include "rtp_llm/cpp/models/Sampler.h"
+#include "rtp_llm/cpp/models/logits_processor/RqCsrLogitsProcessor.h"
 #include "rtp_llm/cpp/test/ModelTestUtil.h"
 
 using namespace std;
@@ -115,6 +116,127 @@ TEST_F(SamplerTest, testMixedDynamicBeamTransitionsUseIndependentOutput) {
     EXPECT_EQ(output[3][0].item<int32_t>(), 4);
     EXPECT_EQ(output[3][1].item<int32_t>(), 4);
     EXPECT_EQ(output[3][step].item<int32_t>(), 8);
+}
+
+TEST_F(SamplerTest, RqPackedAndFlatSupplyOverrideStringSupply) {
+    SamplerInputs inputs{};
+    inputs.logits = torch::zeros({1, 16}, torch::kFloat32);
+    inputs.token_ids = torch::zeros({1, 2}, torch::kInt32);
+    inputs.input_lengths = torch::ones({1}, torch::kInt32);
+    inputs.sequence_lengths = torch::ones({1}, torch::kInt32);
+
+    GenerateConfig config;
+    config.ele_rq_ids = {"3_4_5"};
+    config.ele_rq_ids_pb = "AQAAAAkAIABgAAAA";  // (6, 8, 9)
+    auto packed = RqCsrLogitsProcessor::create(config);
+    ASSERT_TRUE(packed.ok());
+    EXPECT_FALSE(packed.value()->process(inputs, 0, 1).has_value());
+    EXPECT_EQ(inputs.logits.argmax(-1).item<int64_t>(), 6);
+    EXPECT_EQ(inputs.logits.isfinite().sum().item<int64_t>(), 1);
+
+    config.ele_rq_ids_pb = "invalid";
+    config.extra_info = "BgAIAAkA";  // (6, 8, 9) with default zero token bases
+    auto flat = RqCsrLogitsProcessor::create(config);
+    ASSERT_TRUE(flat.ok());
+    inputs.logits.zero_();
+    EXPECT_FALSE(flat.value()->process(inputs, 0, 1).has_value());
+    EXPECT_EQ(inputs.logits.argmax(-1).item<int64_t>(), 6);
+    EXPECT_EQ(inputs.logits.isfinite().sum().item<int64_t>(), 1);
+    config.extra_info.clear();
+    EXPECT_FALSE(RqCsrLogitsProcessor::create(config).ok());
+}
+
+TEST_F(SamplerTest, RqMixedGreedyAndRandomUseFullVocabularyScores) {
+    // Plain / empty CSR / valid CSR / plain. The empty result must retain its
+    // physical slot while exposing zero effective candidates.
+    for (const bool do_sample : {false, true}) {
+        SamplerInputs inputs{};
+        inputs.batch_size = 4;
+        inputs.batch_size_out = 4;
+        inputs.vocab_size = 16;
+        inputs.step = 1;
+        inputs.logits = torch::zeros({4, 16}, torch::kFloat32);
+        inputs.logits[0][4] = 8.0f;
+        inputs.logits[2][5] = 8.0f;  // forbidden but in the denominator
+        inputs.logits[2][6] = 2.0f;
+        inputs.logits[3][7] = 8.0f;
+        inputs.logits = inputs.logits.to(torch::kCUDA);
+        const float expected = 2.0f - inputs.logits[2].logsumexp(0).item<float>();
+        inputs.token_ids = torch::zeros({4, 2}, torch::kInt32);
+        inputs.input_lengths = torch::ones({4}, torch::kInt32);
+        inputs.sequence_lengths = torch::ones({4}, torch::kInt32);
+        inputs.num_beams_in = torch::ones({4}, torch::kLong);
+        inputs.num_beams_out = torch::ones({4}, torch::kLong);
+        inputs.top_k = torch::tensor({1, 1, do_sample ? 2 : 1, 1}, torch::kInt32).pin_memory();
+        inputs.top_p = torch::ones({4}, torch::kFloat32).pin_memory();
+        inputs.temperature = torch::ones({4}, torch::kFloat32).pin_memory();
+        inputs.do_sample = torch::full({4}, do_sample, torch::kBool).pin_memory();
+        inputs.cum_log_probs = torch::zeros({4}, torch::kFloat32);
+        inputs.generator.resize(4);
+        inputs.requests = {{1, false}, {1, true}, {1, true}, {1, false}};
+        inputs.logits_processor_states_ptr = std::make_shared<LogitsProcessorStates>();
+
+        GenerateConfig empty;
+        empty.ele_rq_ids_pb = "AAAAAA==";  // packed payload with zero entries
+        auto empty_csr = RqCsrLogitsProcessor::create(empty);
+        ASSERT_TRUE(empty_csr.ok());
+        inputs.logits_processor_states_ptr->insert(empty_csr.value(), 1, 2);
+        GenerateConfig legal;
+        legal.ele_rq_ids = {"6_8_9"};
+        auto legal_csr = RqCsrLogitsProcessor::create(legal);
+        ASSERT_TRUE(legal_csr.ok());
+        inputs.logits_processor_states_ptr->insert(legal_csr.value(), 2, 3);
+
+        const auto output = sampler_->forward(inputs);
+        EXPECT_EQ(output.effectiveWidth(0, 1), 1);
+        EXPECT_EQ(output.effectiveWidth(1, 1), 0);
+        EXPECT_EQ(output.effectiveWidth(2, 1), 1);
+        EXPECT_EQ(output.effectiveWidth(3, 1), 1);
+        const auto tokens = output.token_ids.cpu();
+        EXPECT_EQ(tokens[0][1].item<int32_t>(), 4);
+        EXPECT_EQ(tokens[2][1].item<int32_t>(), 6);
+        EXPECT_EQ(tokens[3][1].item<int32_t>(), 7);
+        EXPECT_NEAR(output.cum_log_probs[2].item<float>(), expected, 1e-5);
+    }
+}
+
+TEST_F(SamplerTest, RqBeamRanksParentsBeforeCompactingPlannedSlots) {
+    SamplerInputs inputs{};
+    inputs.batch_size = 2;
+    inputs.batch_size_out = 3;
+    inputs.vocab_size = 16;
+    inputs.step = 2;
+    inputs.logits = torch::zeros({2, 16}, torch::kFloat32);
+    inputs.logits[0][5] = 10.0f; // forbidden mass on the first parent
+    inputs.logits[0][6] = 4.0f;
+    inputs.logits[1][7] = 3.0f;
+    inputs.logits = inputs.logits.to(torch::kCUDA);
+    const auto full_lse = inputs.logits.logsumexp(-1).cpu();
+    inputs.token_ids = torch::tensor({0, 1, -1, 0, 2, -1}, torch::kInt32).view({2, 3});
+    inputs.input_lengths = torch::ones({2}, torch::kInt32);
+    inputs.sequence_lengths = torch::full({2}, 2, torch::kInt32);
+    inputs.num_beams_in = torch::full({2}, 2, torch::kLong);
+    inputs.num_beams_out = torch::full({2}, 3, torch::kLong);
+    inputs.cum_log_probs = torch::zeros({2}, torch::kFloat32);
+    inputs.requests = {{2, true}};
+    inputs.logits_processor_states_ptr = std::make_shared<LogitsProcessorStates>();
+    GenerateConfig config;
+    config.ele_rq_ids = {"1_6_8", "2_7_9"};
+    auto csr = RqCsrLogitsProcessor::create(config);
+    ASSERT_TRUE(csr.ok());
+    inputs.logits_processor_states_ptr->insert(csr.value(), 0, 2);
+
+    const auto output = sampler_->forward(inputs);
+    ASSERT_EQ(output.effectiveWidth(0, 3), 2);
+    EXPECT_EQ(output.beam_index[0].item<int32_t>(), 1);
+    EXPECT_EQ(output.beam_index[1].item<int32_t>(), 0);
+    const auto tokens = output.token_ids.cpu();
+    EXPECT_EQ(tokens[0][1].item<int32_t>(), 2);
+    EXPECT_EQ(tokens[0][2].item<int32_t>(), 7);
+    EXPECT_EQ(tokens[1][1].item<int32_t>(), 1);
+    EXPECT_EQ(tokens[1][2].item<int32_t>(), 6);
+    EXPECT_NEAR(output.cum_log_probs[0].item<float>(), 3.0f - full_lse[1].item<float>(), 1e-5);
+    EXPECT_NEAR(output.cum_log_probs[1].item<float>(), 4.0f - full_lse[0].item<float>(), 1e-5);
 }
 
 TEST_F(SamplerTest, testGeneralSampling) {
