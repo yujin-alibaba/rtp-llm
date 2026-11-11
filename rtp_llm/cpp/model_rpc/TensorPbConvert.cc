@@ -64,6 +64,26 @@ void validateInactivePayloadsAreEmpty(const TensorPB& tensor_pb) {
 
 }  // namespace
 
+void TensorPbConvert::validate(const TensorPB& tensor_pb) {
+    validateInactivePayloadsAreEmpty(tensor_pb);
+    switch (tensor_pb.data_type()) {
+        case TensorPB::FP32:
+            validateTensorPayload(tensor_pb, tensor_pb.fp32_data(), sizeof(float));
+            return;
+        case TensorPB::INT32:
+            validateTensorPayload(tensor_pb, tensor_pb.int32_data(), sizeof(int32_t));
+            return;
+        case TensorPB::FP16:
+            validateTensorPayload(tensor_pb, tensor_pb.fp16_data(), sizeof(c10::Half));
+            return;
+        case TensorPB::BF16:
+            validateTensorPayload(tensor_pb, tensor_pb.bf16_data(), sizeof(c10::BFloat16));
+            return;
+        default:
+            throw std::runtime_error("Unsupported data type.");
+    }
+}
+
 at::Tensor TensorPbConvert::pbToTorch(const TensorPB& tensor_pb) {
     std::vector<int64_t> shape(tensor_pb.shape().begin(), tensor_pb.shape().end());
     validateInactivePayloadsAreEmpty(tensor_pb);
