@@ -1,9 +1,13 @@
 import os
+_RQ_LEGACY = os.environ.get("RQ_LEGACY_NUMERICS") == "1"
 from typing import Any, Optional
 
 import torch
 from flashinfer.cascade import merge_state_in_place
-from flashinfer.decode import BatchDecodeWithPagedKVCacheWrapper
+if _RQ_LEGACY:
+    from rtp_llm.rq_compat.decode import LegacyWrapper as BatchDecodeWithPagedKVCacheWrapper
+else:
+    from flashinfer.decode import BatchDecodeWithPagedKVCacheWrapper
 from flashinfer.prefill import (
     BatchPrefillWithPagedKVCacheWrapper,
     BatchPrefillWithRaggedKVCacheWrapper,
@@ -474,6 +478,9 @@ class PyFlashinferPrefillAttnOp(object):
         Args:
             attn_inputs: Attention inputs containing sequence information
         """
+        if _RQ_LEGACY:
+            self._rq_cu = attn_inputs.cu_seqlens_device[:attn_inputs.input_lengths.size(0) + 1]
+            self._rq_max = int(attn_inputs.input_lengths.max().item())
         batch_size = attn_inputs.input_lengths.size(0)
         cu_seqlens = attn_inputs.cu_seqlens_device[: batch_size + 1]
 
@@ -538,6 +545,11 @@ class PyFlashinferPrefillAttnOp(object):
                 FP8_UNIT_SCALE,
                 out=out,
             )
+        if _RQ_LEGACY:
+            from flash_attn import flash_attn_varlen_func
+            return flash_attn_varlen_func(q.contiguous(), k.contiguous(), v.contiguous(),
+                                         self._rq_cu, self._rq_cu, self._rq_max, self._rq_max,
+                                         dropout_p=0.0, causal=self.is_causal)
         return self.prefill_wrapper.run(q, k, v)
 
 

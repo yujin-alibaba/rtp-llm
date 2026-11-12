@@ -1,3 +1,7 @@
+import os
+from pathlib import Path
+import rtp_llm
+_RQ_LEGACY = os.environ.get("RQ_LEGACY_NUMERICS") == "1"
 """Base class for Rotary Positional Embedding operations.
 
 This module provides the abstract base class for implementing RoPE (Rotary Positional Embedding)
@@ -64,6 +68,11 @@ class BaseRotaryEmbeddingOp(ABC):
                     rope_config, max_position_embeddings, is_cuda=True, interleave=False
                 )
                 self.cos_sin_cache = rope_cache.data
+                if _RQ_LEGACY and float(rope_config.base) == 1000000.0 and int(rope_config.dim) == 128 and float(rope_config.scale) == 1.0:
+                    inv_freq = 1.0 / torch.pow(int(rope_config.base), torch.arange(0, 128, 2, dtype=torch.int64).float() / 128)
+                    positions = torch.arange(max_position_embeddings, dtype=torch.int64).float()
+                    freqs = torch.outer(positions, inv_freq)
+                    self.cos_sin_cache = torch.cat([freqs.cos(), freqs.sin()], dim=1).contiguous().cuda()
             except Exception:
                 # If get_rope_cache_once fails, fallback to dynamic computation in _apply_rope
                 self.cos_sin_cache = None
@@ -89,6 +98,21 @@ class BaseRotaryEmbeddingOp(ABC):
         nnz = query.size(0)
         pos_ids = rope_params.positions_d.narrow(0, 0, nnz)
 
+        if _RQ_LEGACY and query.dtype == torch.float16 and query.shape[-1] == 128 and self.cos_sin_cache is not None:
+            import ctypes
+            if not hasattr(self, '_rq_cache_fn'):
+                self._rq_cache_lib = ctypes.CDLL(str(Path(rtp_llm.__file__).parent / 'rq_compat/lib/rope-legacy.so'))
+                self._rq_cache_fn = self._rq_cache_lib.rq_cache_rope
+                self._rq_cache_fn.argtypes = [ctypes.c_void_p]*4+[ctypes.c_int]*2+[ctypes.c_void_p]
+                self._rq_cache_fn.restype = ctypes.c_int
+            positions = pos_ids.int().contiguous()
+            for tensor in (query, key):
+                src = tensor.contiguous()
+                dst = torch.empty_like(src)
+                err = self._rq_cache_fn(src.data_ptr(), dst.data_ptr(), positions.data_ptr(), self.cos_sin_cache.data_ptr(), src.shape[0], src.shape[1], torch.cuda.current_stream().cuda_stream)
+                if err: raise RuntimeError('cache rope diagnostic failed')
+                tensor.copy_(dst)
+            return
         if self.cos_sin_cache is not None:
             rope._apply_rope_pos_ids_cos_sin_cache(  # type: ignore
                 q=query,

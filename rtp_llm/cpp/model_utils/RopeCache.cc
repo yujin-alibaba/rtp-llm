@@ -1,4 +1,6 @@
 #include "rtp_llm/cpp/model_utils/RopeCache.h"
+#include <cstdlib>
+#include <cstring>
 #include "rtp_llm/cpp/utils/Logger.h"
 #include "rtp_llm/cpp/utils/Exception.h"
 
@@ -21,7 +23,10 @@ torch::Tensor genBaseCache(const int   rope_dim,
     // Compute on GPU to avoid CPU multi-threading non-determinism
     // (CPU torch.cos/sin can produce different float32 results across processes
     //  due to MKL/SIMD thread scheduling, causing ~2% cross-rank divergence)
-    auto gpu_opts = torch::TensorOptions(torch::kInt64).device(torch::kCUDA);
+    // Compatibility is opt-in; PG and other models retain the GPU cache path.
+    const char* legacy_env = std::getenv("RQ_LEGACY_CPU_ROPE_CACHE");
+    const bool legacy_cpu = legacy_env && std::strcmp(legacy_env, "1") == 0;
+    auto gpu_opts = torch::TensorOptions(torch::kInt64).device(legacy_cpu ? torch::kCPU : torch::kCUDA);
     auto inv_freq =
         1.f / torch::pow(rope_theta, torch::arange(0, rope_dim, 2, gpu_opts).to(torch::kFloat32) / rope_dim);
     auto t = torch::arange(max_position_embeddings * rope_scale, gpu_opts).to(torch::kFloat32);
@@ -37,7 +42,8 @@ torch::Tensor genBaseCache(const int   rope_dim,
         cos_sin = torch::cat({cos, sin}, 1).contiguous();
     }
 
-    return cos_sin;
+    // Consumers require a device pointer even when cache arithmetic runs on CPU.
+    return legacy_cpu ? cos_sin.to(torch::kCUDA) : cos_sin;
 }
 
 torch::Tensor genYarnCache(const int   rope_dim,

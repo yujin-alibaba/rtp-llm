@@ -1,3 +1,13 @@
+import ctypes
+import os
+from pathlib import Path
+import rtp_llm
+_RQ_LEGACY = os.environ.get("RQ_LEGACY_NUMERICS") == "1"
+if _RQ_LEGACY:
+    _rq_lib = ctypes.CDLL(str(Path(rtp_llm.__file__).parent / "rq_compat/lib/legacy_norm_probe.so"))
+    _rq_norm = _rq_lib.rq_legacy_norm
+    _rq_norm.argtypes = [ctypes.c_void_p]*3 + [ctypes.c_int, ctypes.c_int, ctypes.c_float, ctypes.c_void_p]
+    _rq_norm.restype = ctypes.c_int
 from typing import Optional, Tuple
 
 import flashinfer
@@ -22,9 +32,17 @@ class RMSNorm(BaseNorm):
         stream_id = torch.cuda.current_stream().cuda_stream
         if output is None:
             output = torch.empty_like(hidden_states)
-        rtp_llm_ops.rmsnorm(
-            output, hidden_states, self.weight.data, self.variance_epsilon, stream_id
-        )
+        if (_RQ_LEGACY and hidden_states.is_cuda and hidden_states.dtype == torch.float16
+            and hidden_states.shape[-1] == 1024 and hidden_states.is_contiguous()
+            and self.weight.dtype == torch.float16 and self.weight.is_contiguous()
+            and self.weight.numel() == 1024 and self.weight.device == hidden_states.device
+            and output.dtype == hidden_states.dtype and output.device == hidden_states.device
+            and output.shape == hidden_states.shape and output.is_contiguous()):
+            err = _rq_norm(output.data_ptr(), hidden_states.data_ptr(), self.weight.data.data_ptr(), hidden_states.numel() // 1024, 1024, self.variance_epsilon, stream_id)
+            if err:
+                raise RuntimeError(f"legacy norm diagnostic CUDA error {err}")
+        else:
+            rtp_llm_ops.rmsnorm(output, hidden_states, self.weight.data, self.variance_epsilon, stream_id)
         return output
 
 
@@ -103,6 +121,14 @@ class FusedQKRMSNorm(nn.Module):
         self.enable_pdl = enable_pdl
 
     def forward(self, hidden_states: torch.Tensor):
+        if _RQ_LEGACY:
+            assert hidden_states.dim() == 2
+            m, n = hidden_states.shape
+            rtp_llm_ops.fused_qk_rmsnorm(
+                hidden_states, self.q_weight, self.k_weight, self.eps,
+                self.head_num, self.kv_head_num, m, n, self.size_per_head
+            )
+            return hidden_states
         assert hidden_states.dim() == 2
         m, n = hidden_states.shape
         qkv = hidden_states.reshape(

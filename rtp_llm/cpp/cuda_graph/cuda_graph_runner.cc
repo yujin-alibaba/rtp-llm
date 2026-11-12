@@ -1399,6 +1399,12 @@ void CudaGraphRunner::initCapture() {
             capture_range_ = getPrefillSequenceLengthsToCapture();
         } else {
             capture_range_ = getDecodeBatchSizesToCapture();
+            // Capture keys count expanded decode rows, not incoming requests.
+            // Explicit beam capture sizes may exceed the concurrency limit.
+            for (int capture_bs : capture_range_) {
+                RTP_LLM_CHECK_WITH_INFO(capture_bs > 0, "decode capture batch size must be positive");
+                max_bs_ = std::max(max_bs_, static_cast<size_t>(capture_bs));
+            }
         }
         max_num_token_ = isGenerativePrefillCudaGraph() ? capture_range_.back() : max_bs_ * num_tokens_per_bs_;
         initPrefillScratchTensors();

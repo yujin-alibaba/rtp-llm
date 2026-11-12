@@ -1,5 +1,6 @@
 #include "rtp_llm/cpp/models/Sampler.h"
 #include <cstring>
+#include <cstdlib>
 #include "rtp_llm/cpp/utils/DebugUtils.h"
 #include "rtp_llm/cpp/models/logits_processor/BaseLogitsProcessor.h"
 #include "rtp_llm/cpp/models/logits_processor/LogitsProcessorStates.h"
@@ -179,8 +180,14 @@ SamplerOutput Sampler::forward(const SamplerInputs& inputs) {
         }
         RTP_LLM_CHECK(row == inputs.batch_size);
     }
+    // Opt-in compatibility probe for the frozen c140e65 wheel. Keep current
+    // RQ full-vocabulary scoring as the default; do not silently change ranking.
+    static const bool legacy_masked_normalization = [] {
+        const char* value = std::getenv("RQ_LEGACY_MASKED_NORMALIZATION");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
     for (auto& segment : segments) {
-        if (segment.csr) {
+        if (segment.csr && !legacy_masked_normalization) {
             segment.full_lse = inputs.logits.narrow(0, segment.begin, segment.end - segment.begin)
                                    .to(torch::kFloat32).logsumexp(-1, true);
         }
@@ -229,7 +236,8 @@ SamplerOutput Sampler::forward(const SamplerInputs& inputs) {
 
         torch::Tensor rq_scores;
         if (segment.csr) {
-            rq_scores = logits.to(torch::kFloat32) - segment.full_lse;
+            rq_scores = legacy_masked_normalization ? logits.to(torch::kFloat32).log_softmax(-1) :
+                                                       logits.to(torch::kFloat32) - segment.full_lse;
             rq_scores.masked_fill_(rq_scores.isfinite().logical_not(), -std::numeric_limits<float>::infinity());
         }
 
@@ -354,7 +362,12 @@ SamplerOutput Sampler::forward(const SamplerInputs& inputs) {
             auto cum_log_probs_in_t = cum_log_probs_in_reshaped.to(torch::kCUDA);
 
             if (segment.csr) {
-                logits_t = rq_scores.masked_fill(rq_scores.isfinite().logical_not(), masked_beam_score)
+                // Match TRT TopK's masked sentinel so invalid padding bypasses stable tie reordering.
+                // CSR scores already contain log-probabilities; execSampleBeamSearch skips log_softmax.
+                const char* fast_mask_env = std::getenv("RQ_FAST_MASK_TOPK");
+                const float topk_mask = fast_mask_env && std::strcmp(fast_mask_env, "1") == 0 ?
+                                            -std::numeric_limits<float>::infinity() : masked_beam_score;
+                logits_t = rq_scores.masked_fill(rq_scores.isfinite().logical_not(), topk_mask)
                                .view_as(logits_t).to(torch::kCUDA);
             }
             auto output = execSampleBeamSearch({logits_t,

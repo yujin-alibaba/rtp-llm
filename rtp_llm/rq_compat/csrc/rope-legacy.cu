@@ -1,0 +1,4 @@
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+__global__ void kernel(const half*in,half*out,const int*pos,const float*cache,int tokens,int heads,int mode){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=tokens*heads*64)return;int z=i%64,t=i/(heads*64),a=(i/64)*128+z;float c=cache[pos[t]*128+z],s=cache[pos[t]*128+64+z],x=__half2float(in[a]),y=__half2float(in[a+64]);float u,v;if(mode==0){u=x*c-y*s;v=y*c+x*s;}else if(mode==1){u=__fmaf_rn(x,c,-__fmul_rn(y,s));v=__fmaf_rn(y,c,__fmul_rn(x,s));}else{u=__fmaf_rn(-y,s,__fmul_rn(x,c));v=__fmaf_rn(x,s,__fmul_rn(y,c));}out[a]=__float2half(u);out[a+64]=__float2half(v);}
+extern "C" int rq_cache_rope(const half*in,half*out,const int*pos,const float*cache,int tokens,int heads,cudaStream_t st){int n=tokens*heads*64;kernel<<<(n+255)/256,256,0,st>>>(in,out,pos,cache,tokens,heads,0);return(int)cudaGetLastError();}

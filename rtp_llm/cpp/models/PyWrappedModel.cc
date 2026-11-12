@@ -1,3 +1,5 @@
+#include <cstdlib>
+#include <cstring>
 #include "rtp_llm/cpp/models/PyWrappedModel.h"
 #include "rtp_llm/cpp/cache/KVCacheManager.h"
 #include "rtp_llm/models_py/bindings/core/ExecOps.h"
@@ -1128,7 +1130,10 @@ GptModelOutputs PyWrappedModel::forwardPostLayers(torch::Tensor         hidden,
 
         torch::Tensor logits;
 #if USING_CUDA
-        if (lm_head->kernel.dtype() == torch::kBFloat16) {
+        if (const char* legacy = std::getenv("RQ_LEGACY_FP16_LM_HEAD");
+            legacy && std::strcmp(legacy, "1") == 0 && last_hidden.scalar_type() == torch::kFloat16) {
+            logits = torch_ext::cublas_gemm_fp16_fp16_fp32(last_hidden, lm_head->kernel.to(torch::kFloat16));
+        } else if (lm_head->kernel.dtype() == torch::kBFloat16) {
             logits = torch_ext::cublas_gemm_bf16_bf16_fp32(last_hidden.to(torch::kBFloat16), lm_head->kernel);
         } else
 #endif
@@ -1176,7 +1181,10 @@ GptModelOutputs PyWrappedModel::forwardPostLayersLastHidden(torch::Tensor hidden
     torch::Tensor last_hidden = hidden;
     torch::Tensor logits;
 #if USING_CUDA
-    if (lm_head->kernel.dtype() == torch::kBFloat16) {
+    if (const char* legacy = std::getenv("RQ_LEGACY_FP16_LM_HEAD");
+            legacy && std::strcmp(legacy, "1") == 0 && last_hidden.scalar_type() == torch::kFloat16) {
+            logits = torch_ext::cublas_gemm_fp16_fp16_fp32(last_hidden, lm_head->kernel.to(torch::kFloat16));
+        } else if (lm_head->kernel.dtype() == torch::kBFloat16) {
         logits = torch_ext::cublas_gemm_bf16_bf16_fp32(last_hidden.to(torch::kBFloat16), lm_head->kernel);
     } else
 #endif

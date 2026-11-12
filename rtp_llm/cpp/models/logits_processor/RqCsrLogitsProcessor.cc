@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <array>
 #include <charconv>
+#include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <iterator>
 #include <limits>
@@ -136,7 +138,27 @@ ErrorResult<BaseLogitsProcessorPtr> RqCsrLogitsProcessor::create(const GenerateC
     if (!decodeSupply(config, ids)) {
         return ErrorInfo(ErrorCode::INVALID_PARAMS, "invalid RQ supply encoding");
     }
-    std::sort(ids.begin(), ids.end());
+    const char* fast_env = std::getenv("RQ_FAST_CSR_BUILD");
+    const bool fast_build = fast_env && std::strcmp(fast_env, "1") == 0;
+    if (fast_build && !ids.empty()) {
+        // Stable LSD radix sort preserves lexicographic order for nonnegative SID token IDs.
+        // decodeSupply rejects negative string IDs; packed/flat encodings are unsigned.
+        std::vector<Sid> scratch(ids.size());
+        for (int column = 2; column >= 0; --column) {
+            uint32_t used_bits = 0;
+            for (const auto& sid : ids) used_bits |= static_cast<uint32_t>(sid[column]);
+            for (int shift = 0; shift < 32 && (used_bits >> shift); shift += 8) {
+                std::array<size_t, 256> offsets{};
+                for (const auto& sid : ids) ++offsets[(static_cast<uint32_t>(sid[column]) >> shift) & 255];
+                size_t total = 0;
+                for (auto& offset : offsets) { const auto count = offset; offset = total; total += count; }
+                for (const auto& sid : ids) scratch[offsets[(static_cast<uint32_t>(sid[column]) >> shift) & 255]++] = sid;
+                ids.swap(scratch);
+            }
+        }
+    } else {
+        std::sort(ids.begin(), ids.end());
+    }
     struct Prefix {
         size_t begin;
         size_t end;
@@ -144,6 +166,13 @@ ErrorResult<BaseLogitsProcessorPtr> RqCsrLogitsProcessor::create(const GenerateC
     };
     std::vector<Prefix> rows{{0, ids.size(), 0}};
     auto processor = std::make_shared<RqCsrLogitsProcessor>();
+    if (fast_build) {
+        const size_t max_edges = ids.size() * 3;
+        rows.reserve(max_edges + 1);
+        processor->row_offsets_.reserve(max_edges + 2);
+        processor->tokens_.reserve(max_edges);
+        processor->children_.reserve(max_edges);
+    }
     for (size_t row = 0; row < rows.size(); ++row) {
         const auto [begin, end, depth] = rows[row];
         processor->row_offsets_.push_back(processor->tokens_.size());
