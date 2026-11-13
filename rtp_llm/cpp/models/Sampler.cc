@@ -155,27 +155,29 @@ SamplerOutput Sampler::forward(const SamplerInputs& inputs) {
         size_t begin;
         size_t end;
         bool csr;
+        bool keep_beam_width;
         torch::Tensor full_lse;
     };
     std::vector<Segment> segments;
-    auto append_rows = [&](size_t begin, size_t count, bool csr) {
+    auto append_rows = [&](size_t begin, size_t count, bool csr, bool keep_beam_width) {
         RTP_LLM_CHECK(count > 0 && begin + count <= inputs.batch_size);
         if (!segments.empty() && segments.back().csr == csr
+            && segments.back().keep_beam_width == keep_beam_width
             && num_beams_in[segments.back().begin] == num_beams_in[begin]
             && num_beams_out[segments.back().begin] == num_beams_out[begin]) {
             segments.back().end += count;
         } else {
-            segments.push_back({begin, begin + count, csr, {}});
+            segments.push_back({begin, begin + count, csr, keep_beam_width, {}});
         }
     };
     if (inputs.requests.empty()) {
         for (size_t row = 0; row < inputs.batch_size; ++row) {
-            append_rows(row, 1, false);
+            append_rows(row, 1, false, false);
         }
     } else {
         size_t row = 0;
         for (const auto& request : inputs.requests) {
-            append_rows(row, request.count, request.rq_csr);
+            append_rows(row, request.count, request.rq_csr, request.rq_keep_beam_width);
             row += request.count;
         }
         RTP_LLM_CHECK(row == inputs.batch_size);
@@ -365,7 +367,7 @@ SamplerOutput Sampler::forward(const SamplerInputs& inputs) {
                 // Match TRT TopK's masked sentinel so invalid padding bypasses stable tie reordering.
                 // CSR scores already contain log-probabilities; execSampleBeamSearch skips log_softmax.
                 const char* fast_mask_env = std::getenv("RQ_FAST_MASK_TOPK");
-                const float topk_mask = fast_mask_env && std::strcmp(fast_mask_env, "1") == 0 ?
+                const float topk_mask = !segment.keep_beam_width && fast_mask_env && std::strcmp(fast_mask_env, "1") == 0 ?
                                             -std::numeric_limits<float>::infinity() : masked_beam_score;
                 logits_t = rq_scores.masked_fill(rq_scores.isfinite().logical_not(), topk_mask)
                                .view_as(logits_t).to(torch::kCUDA);
@@ -403,6 +405,12 @@ SamplerOutput Sampler::forward(const SamplerInputs& inputs) {
                     }
                     const auto width = static_cast<int64_t>(keep.size());
                     const auto offset = from_batch_idx_out + request * cur_num_beams_out;
+                    if (segment.keep_beam_width && width > 0) {
+                        // Keep the TopK slots and parent indices for the next forward.
+                        // Terminal and empty results still use the valid width.
+                        effective_widths.emplace(offset, cur_num_beams_out);
+                        continue;
+                    }
                     effective_widths.emplace(offset, width);
                     if (width > 0 && width < cur_num_beams_out) {
                         auto indices = torch::tensor(keep, torch::kLong);

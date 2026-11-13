@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include "torch/all.h"
 #include "rtp_llm/cpp/normal_engine/NormalSamplerInputGatherer.h"
@@ -33,6 +34,10 @@ absl::StatusOr<SamplerInputs> NormalSamplerInputGatherer::gather(const StreamGro
     bool   return_logits              = false;
     bool   calculate_softmax_probs    = false;
     bool   need_tiling                = false;
+    static const bool legacy_beam_width = [] {
+        const auto* value = std::getenv("RQ_LEGACY_BEAM_WIDTH");
+        return value && std::strcmp(value, "1") == 0;
+    }();
     for (auto& stream : all_streams) {
         auto complete_token_ids = stream->completeTokenIds();
         auto complete_seq_len   = complete_token_ids.size(1);
@@ -41,8 +46,11 @@ absl::StatusOr<SamplerInputs> NormalSamplerInputGatherer::gather(const StreamGro
         auto sampler_batch_size =
             stream->needTilingForSampling() ? stream->nextBatchSize() : stream->currentBatchSize();
 
-        sampler_inputs.requests.push_back({static_cast<size_t>(sampler_batch_size),
-                                           stream->generateConfig()->hasRqSupply()});
+        const bool rq_csr = stream->generateConfig()->hasRqSupply();
+        const bool keep_beam_width = legacy_beam_width && rq_csr && !stream->isStreaming()
+                                     && !stream->queryPdSep() && stream->nextBatchSize() > 1
+                                     && static_cast<size_t>(seq_len) + 1 < stream->maxTokenNum();
+        sampler_inputs.requests.push_back({static_cast<size_t>(sampler_batch_size), rq_csr, keep_beam_width});
         for (int i = 0; i < sampler_batch_size; ++i) {
             int cur_batch = std::min(i, current_batch_size - 1);
             memcpy(sampler_inputs.token_ids.data_ptr<int32_t>() + ((batch_idx) * (sampler_inputs.step + 1)),

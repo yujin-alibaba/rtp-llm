@@ -70,6 +70,7 @@ public:
     struct RequestRows {
         size_t count;
         bool rq_csr;
+        bool rq_keep_beam_width = false;
     };
     std::vector<RequestRows> requests;
 };

@@ -226,6 +226,7 @@ TEST_F(SamplerTest, RqBeamRanksParentsBeforeCompactingPlannedSlots) {
     ASSERT_TRUE(csr.ok());
     inputs.logits_processor_states_ptr->insert(csr.value(), 0, 2);
 
+    const auto original_logits = inputs.logits.clone();
     const auto output = sampler_->forward(inputs);
     ASSERT_EQ(output.effectiveWidth(0, 3), 2);
     EXPECT_EQ(output.beam_index[0].item<int32_t>(), 1);
@@ -237,6 +238,16 @@ TEST_F(SamplerTest, RqBeamRanksParentsBeforeCompactingPlannedSlots) {
     EXPECT_EQ(tokens[1][2].item<int32_t>(), 6);
     EXPECT_NEAR(output.cum_log_probs[0].item<float>(), 3.0f - full_lse[1].item<float>(), 1e-5);
     EXPECT_NEAR(output.cum_log_probs[1].item<float>(), 4.0f - full_lse[0].item<float>(), 1e-5);
+
+    inputs.logits = original_logits;
+    inputs.cum_log_probs.zero_();
+    inputs.requests[0].rq_keep_beam_width = true;
+    const auto padded = sampler_->forward(inputs);
+    ASSERT_EQ(padded.effectiveWidth(0, 3), 3);
+    EXPECT_TRUE(torch::equal(padded.token_ids.narrow(0, 0, 2), output.token_ids.narrow(0, 0, 2)));
+    EXPECT_TRUE(torch::equal(padded.beam_index.narrow(0, 0, 2), output.beam_index.narrow(0, 0, 2)));
+    EXPECT_TRUE(torch::equal(padded.cum_log_probs.narrow(0, 0, 2), output.cum_log_probs.narrow(0, 0, 2)));
+    EXPECT_LT(padded.cum_log_probs[2].item<float>(), -1e19f);
 }
 
 TEST_F(SamplerTest, testGeneralSampling) {
