@@ -133,7 +133,21 @@ void RqCsrLogitsProcessor::loadTokenBases(const std::string& checkpoint) {
     }
 }
 
-ErrorResult<BaseLogitsProcessorPtr> RqCsrLogitsProcessor::create(const GenerateConfig& config) {
+ErrorResult<BaseLogitsProcessorPtr> RqCsrLogitsProcessor::create(const GenerateConfig& config,
+                                                             const std::vector<int64_t>& output_vocab_ids) {
+    if (!output_vocab_ids.empty()) {
+        const char* enabled = std::getenv("RQ_COMPACT_CSR");
+        const char* masked = std::getenv("RQ_LEGACY_MASKED_NORMALIZATION");
+        if (!enabled || std::strcmp(enabled, "1") != 0 || !masked || std::strcmp(masked, "1") != 0) {
+            return ErrorInfo(ErrorCode::INVALID_PARAMS,
+                             "compact CSR requires RQ_COMPACT_CSR=1 and RQ_LEGACY_MASKED_NORMALIZATION=1");
+        }
+        if (!std::is_sorted(output_vocab_ids.begin(), output_vocab_ids.end())
+            || std::adjacent_find(output_vocab_ids.begin(), output_vocab_ids.end()) != output_vocab_ids.end()
+            || output_vocab_ids.front() < 0) {
+            return ErrorInfo(ErrorCode::INVALID_PARAMS, "compact CSR vocabulary must be sorted, unique and nonnegative");
+        }
+    }
     std::vector<Sid> ids;
     if (!decodeSupply(config, ids)) {
         return ErrorInfo(ErrorCode::INVALID_PARAMS, "invalid RQ supply encoding");
@@ -185,7 +199,19 @@ ErrorResult<BaseLogitsProcessorPtr> RqCsrLogitsProcessor::create(const GenerateC
             while (next < end && ids[next][depth] == token) {
                 ++next;
             }
+            int32_t column = token;
+            if (!output_vocab_ids.empty()) {
+                const auto it = std::lower_bound(output_vocab_ids.begin(), output_vocab_ids.end(), token);
+                if (it == output_vocab_ids.end() || *it != token) {
+                    return ErrorInfo(ErrorCode::INVALID_PARAMS,
+                                     "RQ supply contains a canonical token absent from the output vocabulary");
+                }
+                column = static_cast<int32_t>(std::distance(output_vocab_ids.begin(), it));
+            }
             processor->tokens_.push_back(token);
+            if (!output_vocab_ids.empty()) {
+                processor->logit_columns_.push_back(column);
+            }
             processor->children_.push_back(rows.size());
             rows.push_back({first, next, depth + 1});
             first = next;
@@ -218,7 +244,7 @@ std::optional<ErrorInfo> RqCsrLogitsProcessor::process(const SamplerInputs& inpu
             continue;
         }
         for (size_t edge = row_offsets_[node]; edge < row_offsets_[node + 1]; ++edge) {
-            const auto token = tokens_[edge];
+            const auto token = logit_columns_.empty() ? tokens_[edge] : logit_columns_[edge];
             if (token < vocab) {
                 allowed.push_back(int64_t(row - begin) * vocab + token);
             }
