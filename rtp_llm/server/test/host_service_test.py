@@ -7,7 +7,12 @@ import unittest
 from typing import Dict
 from unittest.mock import MagicMock, patch
 
-from rtp_llm.server.host_service import FlexlbHeartbeatInfo, MasterService
+from rtp_llm.server.host_service import (
+    FlexlbHeartbeatInfo,
+    HostService,
+    HostServiceArgs,
+    MasterService,
+)
 from rtp_llm.vipserver.host import Host
 from rtp_llm.vipserver.vipserver_proxy import VIPServerProxy
 
@@ -276,6 +281,27 @@ class TestMasterService(unittest.TestCase):
 
 
 class TestNativeVipTimeout(unittest.TestCase):
+    def test_native_publisher_constructor_accepts_timeout(self):
+        args = HostServiceArgs(pdfusion_domain="127.0.0.1:9001", use_local=True)
+        service = HostService(args, http_timeout=0.25)
+        self.addCleanup(service.close)
+        self.assertTrue(service.service_available)
+        self.assertEqual(service.master_service.http_timeout, 0.25)
+
+    def test_explicit_discovery_timeout_reaches_http(self):
+        proxy = VIPServerProxy(http_timeout=0.25)
+        proxy.srv_hosts = ["127.0.0.1"]
+        response = MagicMock()
+        response.json.return_value = {"hosts": []}
+        with patch(
+            "rtp_llm.vipserver.vipserver_proxy.requests.get", return_value=response
+        ) as get, patch(
+            "rtp_llm.vipserver.vipserver_proxy.get_address_server_params",
+            return_value={},
+        ):
+            proxy.req_api("srvIPXT", {"dom": "example"})
+        self.assertEqual(get.call_args.kwargs["timeout"], 0.25)
+
     def test_opt_in_timeout_bounds_joined_discovery_http(self):
         proxy = VIPServerProxy()
         proxy.srv_hosts = ["127.0.0.1"]
