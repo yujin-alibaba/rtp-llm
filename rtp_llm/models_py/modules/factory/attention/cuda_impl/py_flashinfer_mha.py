@@ -1029,7 +1029,6 @@ class RqCascadeDecodeGraph:
 
     def __init__(self, workspace, rows, max_pages):
         self.rows = rows
-        self.max_pages = max_pages
         self.groups = (rows + self.group_size - 1) // self.group_size
         self.q_offsets = torch.tensor(
             [*range(0, rows, self.group_size), rows], dtype=torch.int32
@@ -1040,13 +1039,18 @@ class RqCascadeDecodeGraph:
         def buffer(size):
             return torch.empty(size, dtype=torch.int32, device=workspace.device)
 
+        self.prefix_indices = buffer(self.groups * max_pages)
+        self.tail_indices = buffer(rows * max_pages)
+        self.tail_last_page_len = buffer(rows)
+        self.prefix_offsets = None
+        self.tail_offsets = None
         self.prefix = BatchPrefillWithPagedKVCacheWrapper(
             workspace,
             "HND",
             use_cuda_graph=True,
             qo_indptr_buf=buffer(self.groups + 1),
             paged_kv_indptr_buf=buffer(self.groups + 1),
-            paged_kv_indices_buf=buffer(self.groups * max_pages),
+            paged_kv_indices_buf=self.prefix_indices,
             paged_kv_last_page_len_buf=buffer(self.groups),
             backend="fa2",
         )
@@ -1055,8 +1059,8 @@ class RqCascadeDecodeGraph:
             "HND",
             use_cuda_graph=True,
             paged_kv_indptr_buffer=buffer(rows + 1),
-            paged_kv_indices_buffer=buffer(rows * max_pages),
-            paged_kv_last_page_len_buffer=buffer(rows),
+            paged_kv_indices_buffer=self.tail_indices,
+            paged_kv_last_page_len_buffer=self.tail_last_page_len,
         )
 
     def plan(self, indptr, indices, last_page_len, heads, kv_heads, dim, page_size):
@@ -1095,14 +1099,28 @@ class RqCascadeDecodeGraph:
         shape = (heads, kv_heads, dim, page_size)
         dtype = {"q_data_type": torch.bfloat16, "kv_data_type": torch.bfloat16}
         self.merge_mask.copy_(torch.tensor(merge_mask, dtype=torch.bool))
-        self.prefix.plan(
-            self.q_offsets, host(prefix_offsets), host(prefix_pages),
-            host([page_size] * self.groups), *shape, disable_split_kv=True, **dtype
-        )
-        self.tail.plan(
-            host(tail_offsets), host(tail_pages), last_page_len,
-            *shape, disable_split_kv=True, **dtype
-        )
+        # A repeated page topology keeps the graph plan valid even when the
+        # scheduler assigns new physical page IDs. Prefix pages are always full.
+        prefix_ids = host(prefix_pages)
+        if self.prefix_offsets == prefix_offsets:
+            self.prefix_indices[: len(prefix_pages)].copy_(prefix_ids)
+        else:
+            self.prefix.plan(
+                self.q_offsets, host(prefix_offsets), prefix_ids,
+                host([page_size] * self.groups), *shape, disable_split_kv=True, **dtype,
+            )
+            self.prefix_offsets = prefix_offsets
+
+        tail_ids = host(tail_pages)
+        if self.tail_offsets == tail_offsets:
+            self.tail_indices[: len(tail_pages)].copy_(tail_ids)
+            self.tail_last_page_len.copy_(last_page_len)
+        else:
+            self.tail.plan(
+                host(tail_offsets), tail_ids, last_page_len,
+                *shape, disable_split_kv=True, **dtype,
+            )
+            self.tail_offsets = tail_offsets
         if any(merge_mask) and not self.logged_shared_prefix and any(page_ids):
             self.logged_shared_prefix = True
             print(
