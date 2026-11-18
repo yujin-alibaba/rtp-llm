@@ -1038,6 +1038,18 @@ class RqCascadeDecodeGraph:
         )
         self.merge_mask = torch.empty(rows, dtype=torch.bool, device=workspace.device)
         self.logged_shared_prefix = False
+        self.async_metadata = os.environ.get("RQ_CASCADE_ASYNC_METADATA") == "1"
+        self.native_planner = (
+            getattr(rtp_llm_ops.FlashInferMlaAttnParams, "cascade_group_layout", None)
+            if os.environ.get("RQ_CASCADE_NATIVE_PLAN") == "1"
+            else None
+        )
+        self.decode_flattener = (
+            getattr(rtp_llm_ops.FlashInferMlaAttnParams, "cascade_decode_metadata", None)
+            if os.environ.get("RQ_CASCADE_HOST_ONLY_PLAN") == "1"
+            else None
+        )
+        self.native_max_pages = max_pages
 
         def buffer(size):
             return torch.empty(size, dtype=torch.int32, device=workspace.device)
@@ -1066,7 +1078,27 @@ class RqCascadeDecodeGraph:
             paged_kv_last_page_len_buffer=self.tail_last_page_len,
         )
 
-    def plan(self, indptr, indices, last_page_len, heads, kv_heads, dim, page_size):
+    def _upload_cached_layout(self, prefix_pages, tail_pages, merge_mask, last_page_len):
+        # CPU staging is pinned and allocated by Torch's host allocator so each
+        # nonblocking copy records the source lifetime on the current stream.
+        prefix_count = len(prefix_pages)
+        tail_count = len(tail_pages)
+        total_ids = prefix_count + tail_count + self.rows
+        host = torch.empty(total_ids + (self.rows + 3) // 4, dtype=torch.int32, pin_memory=True)
+        prefix = host[:prefix_count]
+        tail = host[prefix_count : prefix_count + tail_count]
+        last = host[prefix_count + tail_count : total_ids]
+        mask = host[total_ids:].view(torch.bool)[:self.rows]
+        prefix.copy_(torch.tensor(prefix_pages, dtype=torch.int32))
+        tail.copy_(torch.tensor(tail_pages, dtype=torch.int32))
+        last.copy_(last_page_len)
+        mask.copy_(torch.tensor(merge_mask, dtype=torch.bool))
+        self.prefix_indices[:prefix_count].copy_(prefix, non_blocking=True)
+        self.tail_indices[:tail_count].copy_(tail, non_blocking=True)
+        self.tail_last_page_len.copy_(last, non_blocking=True)
+        self.merge_mask.copy_(mask, non_blocking=True)
+
+    def _build_layout(self, indptr, indices):
         offsets = indptr.tolist()
         page_ids = indices[: offsets[-1]].tolist()
         prefix_offsets, tail_offsets = [0], [0]
@@ -1096,12 +1128,46 @@ class RqCascadeDecodeGraph:
                 tail_pages.extend(page_ids[offsets[row] + count : offsets[row + 1]])
                 tail_offsets.append(len(tail_pages))
 
+        return prefix_offsets, tail_offsets, prefix_pages, tail_pages, merge_mask
+
+    def plan(self, indptr, indices, last_page_len, heads, kv_heads, dim, page_size):
+        layout = None
+        if self.native_planner is not None and not torch.cuda.is_current_stream_capturing():
+            native_layout = self.native_planner(
+                indptr, indices, self.rows, self.group_size, self.min_prefix_pages, self.native_max_pages
+            )
+            if native_layout is not None:
+                prefix_offsets, tail_offsets, *data = native_layout
+                layout = prefix_offsets.tolist(), tail_offsets.tolist(), *data
+        native = layout is not None
+        if layout is None:
+            layout = self._build_layout(indptr, indices)
+        prefix_offsets, tail_offsets, prefix_pages, tail_pages, merge_mask = layout
+
         def host(values):
-            return torch.tensor(values, dtype=torch.int32)
+            return torch.as_tensor(values, dtype=torch.int32)
 
         shape = (heads, kv_heads, dim, page_size)
         dtype = {"q_data_type": torch.bfloat16, "kv_data_type": torch.bfloat16}
-        self.merge_mask.copy_(torch.tensor(merge_mask, dtype=torch.bool))
+        # Replays with unchanged topology only update the contents of the
+        # captured buffers. Enqueue on the same stream as the graph replay.
+        if (self.async_metadata and self.prefix_offsets == prefix_offsets
+                and self.tail_offsets == tail_offsets and last_page_len.device.type == "cpu"
+                and not torch.cuda.is_current_stream_capturing()):
+            if native:
+                self.prefix_indices[:len(prefix_pages)].copy_(prefix_pages, non_blocking=True)
+                self.tail_indices[:len(tail_pages)].copy_(tail_pages, non_blocking=True)
+                # FlashInfer refreshes its host mirror in place. Use a private
+                # snapshot so the next plan cannot race this nonblocking copy.
+                last = torch.empty_like(last_page_len, pin_memory=True)
+                last.copy_(last_page_len)
+                self.tail_last_page_len.copy_(last, non_blocking=True)
+                self.merge_mask.copy_(merge_mask, non_blocking=True)
+            else:
+                self._upload_cached_layout(prefix_pages, tail_pages, merge_mask, last_page_len)
+            return
+
+        self.merge_mask.copy_(torch.as_tensor(merge_mask, dtype=torch.bool))
         # A repeated page topology keeps the graph plan valid even when the
         # scheduler assigns new physical page IDs. Prefix pages are always full.
         prefix_ids = host(prefix_pages)
@@ -1124,7 +1190,7 @@ class RqCascadeDecodeGraph:
                 *shape, disable_split_kv=True, **dtype,
             )
             self.tail_offsets = tail_offsets
-        if any(merge_mask) and not self.logged_shared_prefix and any(page_ids):
+        if any(merge_mask) and not self.logged_shared_prefix and (any(prefix_pages) or any(tail_pages)):
             self.logged_shared_prefix = True
             print(
                 f"RQ_CASCADE_GRAPH_ACTIVE bucket={self.rows} shared_rows={sum(merge_mask)}",
@@ -1361,6 +1427,19 @@ class PyFlashinferDecodeAttnOp(object):
             block_id_host = attn_inputs.kv_cache_kernel_block_id
             if block_id_host is None or block_id_host.numel() == 0:
                 block_id_host = attn_inputs.kv_cache_kernel_block_id_device
+            if (self.cascade_graph is not None and self.cascade_graph.decode_flattener is not None
+                and not attn_inputs.is_prefill and not attn_inputs.is_target_verify
+                and (attn_inputs.prefix_lengths is None or attn_inputs.prefix_lengths.numel() == 0)
+                and not torch.cuda.is_current_stream_capturing()):
+                metadata = None
+                if block_id_host is not None:
+                    metadata = self.cascade_graph.decode_flattener(
+                        attn_inputs.sequence_lengths, block_id_host, self.cascade_graph.rows, self.seq_size_per_block
+                    )
+                if metadata is not None:
+                    self.cascade_graph.plan(*metadata, self.local_head_num,
+                                            self.local_kv_head_num, self.head_dim_qk, self.seq_size_per_block)
+                    return
             self.fmha_params.fill_params(
                 _host_i32(attn_inputs.prefix_lengths),
                 _host_i32(attn_inputs.sequence_lengths),

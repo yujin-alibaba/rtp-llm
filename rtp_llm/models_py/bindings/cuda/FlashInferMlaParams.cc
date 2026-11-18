@@ -6,6 +6,10 @@
 #include "rtp_llm/models_py/bindings/common/Torch_ext.h"
 #include "rtp_llm/models_py/bindings/cuda/kernels/mha_paged_attn_plan.h"
 #include <cstdint>
+#include <cstring>
+#include <limits>
+#include <optional>
+#include <pybind11/stl.h>
 #include <algorithm>
 #include <numeric>
 #include <cuda_runtime.h>
@@ -43,6 +47,184 @@ torch::Tensor toDeviceContiguousI32(const torch::Tensor& tensor) {
         t = t.to(torch::kInt32);
     }
     return t.is_contiguous() ? t : t.contiguous();
+}
+
+int buildCascadePlan(const int32_t* offsets,
+                     const int32_t* indices,
+                     int rows,
+                     int group_size,
+                     int minimum_prefix,
+                     int input_capacity,
+                     int max_pages,
+                     int32_t* prefix_offsets,
+                     int32_t* tail_offsets,
+                     int32_t* prefix_pages,
+                     int32_t* tail_pages,
+                     uint8_t* merge_mask) {
+    if (rows <= 0 || group_size <= 0 || minimum_prefix <= 0 || max_pages <= 0 ||
+        rows > std::numeric_limits<int32_t>::max() / max_pages || offsets[0] != 0 ||
+        offsets[rows] < 0 || offsets[rows] > input_capacity) {
+        return 1;
+    }
+    for (int row = 0; row < rows; ++row) {
+        if (offsets[row + 1] < offsets[row] || offsets[row + 1] - offsets[row] > max_pages) {
+            return 1;
+        }
+    }
+    int prefix_count = 0;
+    int tail_count = 0;
+    int group = 0;
+    prefix_offsets[0] = tail_offsets[0] = 0;
+    for (int begin = 0; begin < rows;) {
+        const int end = begin + std::min(group_size, rows - begin);
+        int shared = offsets[begin + 1] - offsets[begin] - 1;
+        for (int row = begin + 1; row < end && shared >= minimum_prefix; ++row) {
+            shared = std::min(shared, offsets[row + 1] - offsets[row] - 1);
+            int equal = 0;
+            while (equal < shared && indices[offsets[begin] + equal] == indices[offsets[row] + equal]) {
+                ++equal;
+            }
+            shared = equal;
+        }
+        if (shared < minimum_prefix) {
+            shared = 0;
+        }
+        if (shared) {
+            std::memcpy(prefix_pages + prefix_count, indices + offsets[begin], shared * sizeof(int32_t));
+            prefix_count += shared;
+        } else {
+            prefix_pages[prefix_count++] = offsets[begin] < offsets[begin + 1] ? indices[offsets[begin]] : 0;
+        }
+        prefix_offsets[++group] = prefix_count;
+        for (int row = begin; row < end; ++row) {
+            merge_mask[row] = shared != 0;
+            const int count = offsets[row + 1] - offsets[row] - shared;
+            if (count) {
+                std::memcpy(tail_pages + tail_count, indices + offsets[row] + shared, count * sizeof(int32_t));
+                tail_count += count;
+            }
+            tail_offsets[row + 1] = tail_count;
+        }
+        begin = end;
+    }
+    return 0;
+}
+
+int flattenCascadeDecode(const int32_t* sequence_lengths,
+                         const int32_t* block_table,
+                         int rows,
+                         int stride,
+                         int page_size,
+                         int32_t* offsets,
+                         int32_t* page_ids,
+                         int32_t* last_page_lengths) {
+    if (rows <= 0 || stride <= 0 || page_size <= 0 ||
+        rows > std::numeric_limits<int32_t>::max() / stride) {
+        return 1;
+    }
+    int total_pages = 0;
+    offsets[0] = 0;
+    for (int row = 0; row < rows; ++row) {
+        const int past_length = sequence_lengths[row];
+        if (past_length < 0 || past_length / page_size >= stride) {
+            return 1;
+        }
+        const int pages = past_length / page_size + 1;
+        std::memcpy(page_ids + total_pages, block_table + row * stride, pages * sizeof(int32_t));
+        total_pages += pages;
+        offsets[row + 1] = total_pages;
+        last_page_lengths[row] = past_length % page_size + 1;
+    }
+    return 0;
+}
+
+bool isHostI32(const torch::Tensor& tensor, int64_t dims) {
+    return tensor.defined() && tensor.device().is_cpu() && tensor.scalar_type() == torch::kInt32
+           && tensor.dim() == dims && tensor.is_contiguous();
+}
+
+using CascadeMetadata = std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>;
+
+std::optional<CascadeMetadata> cascadeDecodeMetadata(const torch::Tensor& lengths,
+                                                     const torch::Tensor& block_table,
+                                                     int rows,
+                                                     int page_size) {
+    if (!isHostI32(lengths, 1) || !isHostI32(block_table, 2)
+        || rows <= 0 || page_size <= 0 || lengths.size(0) != rows || block_table.size(0) != rows
+        || block_table.size(1) <= 0 || block_table.size(1) > std::numeric_limits<int32_t>::max() / rows) {
+        return std::nullopt;
+    }
+
+    const auto stride = static_cast<int>(block_table.size(1));
+    const int64_t offset_count = static_cast<int64_t>(rows) + 1;
+    auto arena = torch::empty({offset_count + block_table.numel() + rows},
+                             torch::TensorOptions().dtype(torch::kInt32).pinned_memory(true));
+    auto offsets = arena.narrow(0, 0, offset_count);
+    auto pages = arena.narrow(0, offset_count, block_table.numel());
+    auto last = arena.narrow(0, offset_count + block_table.numel(), rows);
+    auto* offset_data = offsets.data_ptr<int32_t>();
+    if (flattenCascadeDecode(lengths.data_ptr<int32_t>(),
+                             block_table.data_ptr<int32_t>(),
+                             rows,
+                             stride,
+                             page_size,
+                             offset_data,
+                             pages.data_ptr<int32_t>(),
+                             last.data_ptr<int32_t>()) != 0) {
+        return std::nullopt;
+    }
+    return CascadeMetadata{offsets, pages.narrow(0, 0, offset_data[rows]), last};
+}
+
+using CascadeLayout =
+    std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>;
+
+std::optional<CascadeLayout> cascadeGroupLayout(const torch::Tensor& offsets,
+                                                const torch::Tensor& indices,
+                                                int rows,
+                                                int group_size,
+                                                int min_prefix,
+                                                int max_pages) {
+    if (!isHostI32(offsets, 1) || !isHostI32(indices, 1)
+        || rows <= 0 || group_size <= 0 || min_prefix <= 0 || max_pages <= 0
+        || offsets.numel() != static_cast<int64_t>(rows) + 1
+        || indices.numel() > std::numeric_limits<int32_t>::max()
+        || max_pages > std::numeric_limits<int32_t>::max() / rows) {
+        return std::nullopt;
+    }
+    const int64_t groups = (static_cast<int64_t>(rows) - 1) / group_size + 1;
+    const int64_t offsets_size = groups + 1 + static_cast<int64_t>(rows) + 1;
+    const int64_t prefix_size = groups * max_pages;
+    const int64_t tail_size = static_cast<int64_t>(rows) * max_pages;
+    auto options = torch::TensorOptions().dtype(torch::kInt32).pinned_memory(true);
+    auto arena = torch::empty({offsets_size + prefix_size + tail_size}, options);
+    auto prefix_offsets = arena.narrow(0, 0, groups + 1);
+    auto tail_offsets = arena.narrow(0, groups + 1, static_cast<int64_t>(rows) + 1);
+    auto prefix = arena.narrow(0, offsets_size, prefix_size);
+    auto tail = arena.narrow(0, offsets_size + prefix_size, tail_size);
+    auto mask = torch::empty({rows}, options.dtype(torch::kBool));
+    auto* prefix_offset_data = prefix_offsets.data_ptr<int32_t>();
+    auto* tail_offset_data = tail_offsets.data_ptr<int32_t>();
+    static_assert(sizeof(bool) == sizeof(uint8_t));
+    if (buildCascadePlan(offsets.data_ptr<int32_t>(),
+                         indices.data_ptr<int32_t>(),
+                         rows,
+                         group_size,
+                         min_prefix,
+                         static_cast<int>(indices.numel()),
+                         max_pages,
+                         prefix_offset_data,
+                         tail_offset_data,
+                         prefix.data_ptr<int32_t>(),
+                         tail.data_ptr<int32_t>(),
+                         reinterpret_cast<uint8_t*>(mask.data_ptr<bool>())) != 0) {
+        return std::nullopt;
+    }
+    return CascadeLayout{prefix_offsets,
+                         tail_offsets,
+                         prefix.narrow(0, 0, prefix_offset_data[groups]),
+                         tail.narrow(0, 0, tail_offset_data[rows]),
+                         mask};
 }
 
 }  // namespace
@@ -692,6 +874,8 @@ void registerPyFlashInferMlaParams(pybind11::module& m) {
     pybind11::class_<FlashInferMlaAttnParams, std::shared_ptr<FlashInferMlaAttnParams>, rtp_llm::ParamsBase>(
         m, "FlashInferMlaAttnParams")
         .def(pybind11::init<>())
+        .def_static("cascade_decode_metadata", &cascadeDecodeMetadata)
+        .def_static("cascade_group_layout", &cascadeGroupLayout)
         .def(
             "fill_params",
             [](rtp_llm::FlashInferMlaAttnParams& self,
