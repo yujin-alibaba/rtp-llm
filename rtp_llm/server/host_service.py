@@ -7,13 +7,16 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from enum import Enum
 from types import MappingProxyType
-from typing import Dict, List, Mapping, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Mapping, Optional, Tuple
 
 from pydantic import BaseModel, Field
 
 from rtp_llm.config.generate_config import RoleAddr, RoleType
 from rtp_llm.metrics import kmonitor
 from rtp_llm.metrics.kmonitor_metric_reporter import GaugeMetrics
+
+if TYPE_CHECKING:
+    from rtp_llm.vipserver.vip_client import VipClient
 
 route_logger = logging.getLogger("route_logger")
 
@@ -92,7 +95,10 @@ class RouteSnapshot:
 
 
 class VipServerWrapper:
-    def __init__(self, domain: str, use_local: bool = False):
+    def __init__(
+        self, domain: str, use_local: bool = False, vip_client: Optional["VipClient"] = None
+    ):
+        self.vip_client = vip_client
         self.cnt = 0
         self.use_local = use_local
         self.domain = domain
@@ -107,25 +113,10 @@ class VipServerWrapper:
                 hosts.append(Host(ip, port))
             self.hosts = hosts
         else:
-            from rtp_llm.vipserver import get_host_list_by_domain
-
-            self.hosts = get_host_list_by_domain(self.domain)
+            self.get_hosts()
 
     def get_host(self, refresh: bool = False) -> Optional[Host]:
-        if not self.domain:
-            return None
-        if self.use_local:
-            hosts = self.hosts
-        else:
-            from rtp_llm.vipserver import (
-                get_host_list_by_domain,
-                get_host_list_by_domain_now,
-            )
-
-            get_hosts = (
-                get_host_list_by_domain_now if refresh else get_host_list_by_domain
-            )
-            hosts = get_hosts(self.domain)
+        hosts = self.get_hosts(refresh)
         if not hosts:
             return None
         cur_idx = self.cnt % len(hosts)
@@ -136,17 +127,17 @@ class VipServerWrapper:
         if not self.domain:
             return []
         if self.use_local:
-            hosts = self.hosts
-        else:
-            from rtp_llm.vipserver import (
-                get_host_list_by_domain,
-                get_host_list_by_domain_now,
-            )
+            return self.hosts
+        client = self.vip_client
+        if client is None:
+            from rtp_llm.vipserver.vip_client import global_vip_client
 
-            get_hosts = (
-                get_host_list_by_domain_now if refresh else get_host_list_by_domain
-            )
-            hosts = get_hosts(self.domain)
+            client = global_vip_client
+        hosts = (
+            client.get_host_list_by_domain_now(self.domain)
+            if refresh
+            else client.get_host_list_by_domain(self.domain)
+        )
         return hosts if hosts else []
 
 
@@ -238,8 +229,9 @@ class MasterService:
     # - Network probes run without holding locks.
     # - A lightweight snapshot lock only protects _route_snapshot publication/reads.
     # - host_health_map is local mutable state owned by the refresh thread.
-    def __init__(self, master_vip: VipServerWrapper):
+    def __init__(self, master_vip: VipServerWrapper, http_timeout: float = 0.5):
         self.master_vip = master_vip
+        self.http_timeout = http_timeout
         self.unhealthy_node_timeout = 30.0
         self.refresh_interval_seconds = 1.0
         self.max_parallel_probes = 4
@@ -346,7 +338,9 @@ class MasterService:
         try:
             import requests
 
-            response = requests.post(request_url, headers=headers, json={}, timeout=0.5)
+            response = requests.post(
+                request_url, headers=headers, json={}, timeout=self.http_timeout
+            )
             if response.status_code == 200:
                 result = response.json()
                 return {
@@ -566,41 +560,50 @@ class MasterService:
 
 
 class HostService:
-    def __init__(self, args: Optional[HostServiceArgs] = None):
+    def __init__(
+        self,
+        args: Optional[HostServiceArgs] = None,
+        *,
+        http_timeout: Optional[float] = None,
+    ):
         if args is None:
             args = HostServiceArgs.create_from_env()
-        use_local = args.use_local
-        self.master_vip = VipServerWrapper(args.master_domain, use_local)
-        self.master_service = MasterService(self.master_vip)
+        domains = {
+            RoleType.PDFUSION: args.pdfusion_domain,
+            RoleType.PREFILL: args.prefill_domain,
+            RoleType.DECODE: args.decode_domain,
+            RoleType.VIT: args.vit_domain,
+        }
+        self.vip_client = None
+        if http_timeout is not None and not args.use_local and (
+            args.master_domain or any(domains.values())
+        ):
+            from rtp_llm.vipserver.host_reactor import HostReactor
+            from rtp_llm.vipserver.vip_client import VipClient
+            from rtp_llm.vipserver.vipserver_proxy import VIPServerProxy
+
+            self.vip_client = VipClient(
+                HostReactor(VIPServerProxy(http_timeout=http_timeout))
+            )
         try:
+            self.master_vip = VipServerWrapper(
+                args.master_domain, args.use_local, self.vip_client
+            )
             self.role_vip_map: Dict[RoleType, Optional[VipServerWrapper]] = {
-                RoleType.PDFUSION: (
-                    VipServerWrapper(args.pdfusion_domain, use_local)
-                    if args.pdfusion_domain
-                    else None
-                ),
-                RoleType.PREFILL: (
-                    VipServerWrapper(args.prefill_domain, use_local)
-                    if args.prefill_domain
-                    else None
-                ),
-                RoleType.DECODE: (
-                    VipServerWrapper(args.decode_domain, use_local)
-                    if args.decode_domain
-                    else None
-                ),
-                RoleType.VIT: (
-                    VipServerWrapper(args.vit_domain, use_local)
-                    if args.vit_domain
-                    else None
-                ),
+                role: VipServerWrapper(domain, args.use_local, self.vip_client)
+                if domain
+                else None
+                for role, domain in domains.items()
             }
-            self.service_available = bool(self.master_vip.domain) or any(
-                self.role_vip_map.values()
+            self.master_service = MasterService(
+                self.master_vip, http_timeout=0.5 if http_timeout is None else http_timeout
             )
         except BaseException:
-            self.master_service.close()
+            self._close_vip_client()
             raise
+        self.service_available = bool(self.master_vip.domain) or any(
+            self.role_vip_map.values()
+        )
 
     def get_master_addr(self) -> Optional[str]:
         return self.master_service.get_master_addr()
@@ -613,6 +616,12 @@ class HostService:
 
     def close(self) -> None:
         self.master_service.close()
+        self._close_vip_client()
+
+    def _close_vip_client(self) -> None:
+        if self.vip_client is not None:
+            self.vip_client.host_reactor.close()
+            self.vip_client = None
 
     def get_backend_role_addrs(
         self, role_list: List[RoleType], refresh: bool = False

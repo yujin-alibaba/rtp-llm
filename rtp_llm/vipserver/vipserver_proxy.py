@@ -10,7 +10,9 @@ from rtp_llm.vipserver.netutil import NetUtils
 from rtp_llm.vipserver.update_thread import UpdateThread
 
 
-def _request_options():
+def _request_options(http_timeout=None):
+    if http_timeout is not None:
+        return {"timeout": http_timeout}
     # Native PG joins its discovery workers before unloading the pybind owner.
     # Its child opts into finite VIP HTTP waits; other server modes retain the
     # existing requests defaults.
@@ -37,7 +39,8 @@ class VIPServerProxy:
     srv_hosts = []
     srv_update_lock = threading.Lock()
 
-    def __init__(self):
+    def __init__(self, *, http_timeout=None):
+        self.http_timeout = http_timeout
         self.jmenv = "jmenv.tbsite.net:8080"
         jm_domain = os.getenv("address.server.domain")
         if jm_domain:
@@ -76,7 +79,7 @@ class VIPServerProxy:
         jmenv_url = f"http://{self.jmenv}/vipserver/serverlist?nofix=1&{query_string}"
 
         try:
-            resp = requests.get(jmenv_url, **_request_options()).text
+            resp = requests.get(jmenv_url, **_request_options(self.http_timeout)).text
             srv_lst = []
             for srv in resp.split("\n"):
                 if srv.strip() == "":
@@ -113,7 +116,7 @@ class VIPServerProxy:
                 try:
                     resp = requests.get(
                         f"http://{srv}:80/vipserver/api/{api}?{get_query_string(req_params)}",
-                        **_request_options(),
+                        **_request_options(self.http_timeout),
                     )
                     resp_json = resp.json()
                     return resp_json
