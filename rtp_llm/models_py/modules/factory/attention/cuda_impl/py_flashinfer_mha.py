@@ -1021,6 +1021,102 @@ def determine_use_tensor_core_from_configs(attn_configs: AttentionConfigs) -> bo
     return attn_configs.head_num // attn_configs.kv_head_num >= 4
 
 
+class RqCascadeDecodeGraph:
+    """Run shared-prefix FA2 and Paged Decode tail in a fixed Decode Graph bucket."""
+
+    group_size = 32
+    min_prefix_pages = 4
+
+    def __init__(self, workspace, rows, max_pages):
+        self.rows = rows
+        self.max_pages = max_pages
+        self.groups = (rows + self.group_size - 1) // self.group_size
+        self.q_offsets = torch.tensor(
+            [*range(0, rows, self.group_size), rows], dtype=torch.int32
+        )
+        self.merge_mask = torch.empty(rows, dtype=torch.bool, device=workspace.device)
+        self.logged_shared_prefix = False
+
+        def buffer(size):
+            return torch.empty(size, dtype=torch.int32, device=workspace.device)
+
+        self.prefix = BatchPrefillWithPagedKVCacheWrapper(
+            workspace,
+            "HND",
+            use_cuda_graph=True,
+            qo_indptr_buf=buffer(self.groups + 1),
+            paged_kv_indptr_buf=buffer(self.groups + 1),
+            paged_kv_indices_buf=buffer(self.groups * max_pages),
+            paged_kv_last_page_len_buf=buffer(self.groups),
+            backend="fa2",
+        )
+        self.tail = BatchDecodeWithPagedKVCacheWrapper(
+            workspace,
+            "HND",
+            use_cuda_graph=True,
+            paged_kv_indptr_buffer=buffer(rows + 1),
+            paged_kv_indices_buffer=buffer(rows * max_pages),
+            paged_kv_last_page_len_buffer=buffer(rows),
+        )
+
+    def plan(self, indptr, indices, last_page_len, heads, kv_heads, dim, page_size):
+        offsets = indptr.tolist()
+        page_ids = indices[: offsets[-1]].tolist()
+        prefix_offsets, tail_offsets = [0], [0]
+        prefix_pages, tail_pages, merge_mask = [], [], []
+        for begin in range(0, self.rows, self.group_size):
+            end = min(begin + self.group_size, self.rows)
+            first = offsets[begin]
+            shared = min(offsets[row + 1] - offsets[row] - 1 for row in range(begin, end))
+            count = 0
+            while count < shared:
+                page = page_ids[first + count]
+                if any(page_ids[offsets[row] + count] != page for row in range(begin + 1, end)):
+                    break
+                count += 1
+            if count < self.min_prefix_pages:
+                count = 0
+
+            # Keep a valid nonempty graph segment even when this group does not
+            # share pages. The per-row merge mask then selects the full tail.
+            if count:
+                prefix_pages.extend(page_ids[first : first + count])
+            else:
+                prefix_pages.append(page_ids[first] if first < offsets[begin + 1] else 0)
+            prefix_offsets.append(len(prefix_pages))
+            merge_mask.extend([count != 0] * (end - begin))
+            for row in range(begin, end):
+                tail_pages.extend(page_ids[offsets[row] + count : offsets[row + 1]])
+                tail_offsets.append(len(tail_pages))
+
+        def host(values):
+            return torch.tensor(values, dtype=torch.int32)
+
+        shape = (heads, kv_heads, dim, page_size)
+        dtype = {"q_data_type": torch.bfloat16, "kv_data_type": torch.bfloat16}
+        self.merge_mask.copy_(torch.tensor(merge_mask, dtype=torch.bool))
+        self.prefix.plan(
+            self.q_offsets, host(prefix_offsets), host(prefix_pages),
+            host([page_size] * self.groups), *shape, disable_split_kv=True, **dtype
+        )
+        self.tail.plan(
+            host(tail_offsets), host(tail_pages), last_page_len,
+            *shape, disable_split_kv=True, **dtype
+        )
+        if any(merge_mask) and not self.logged_shared_prefix and any(page_ids):
+            self.logged_shared_prefix = True
+            print(
+                f"RQ_CASCADE_GRAPH_ACTIVE bucket={self.rows} shared_rows={sum(merge_mask)}",
+                flush=True,
+            )
+
+    def run(self, q, kv_cache):
+        output, lse = self.tail.run(q, kv_cache, return_lse=True)
+        prefix, prefix_lse = self.prefix.run(q, kv_cache, return_lse=True)
+        merge_state_in_place(output, lse, prefix, prefix_lse, self.merge_mask)
+        return output
+
+
 class PyFlashinferDecodeAttnOp(object):
     def __init__(
         self,
@@ -1048,6 +1144,21 @@ class PyFlashinferDecodeAttnOp(object):
             attn_q_dtype(attn_configs) if self.use_tensor_core else self.dtype
         )
         self.enable_cuda_graph = attn_inputs.is_cuda_graph
+        self.cascade_graph = None
+        rows = attn_inputs.input_lengths.size(0)
+        if (
+            os.environ.get("RQ_ENABLE_CASCADE_GRAPH") == "1"
+            and self.enable_cuda_graph
+            and 128 <= rows <= 512
+            and not _RQ_LEGACY
+            and not self.use_tensor_core
+            and self.q_dtype == self.kv_dtype == torch.bfloat16
+        ):
+            self.cascade_graph = RqCascadeDecodeGraph(
+                self.g_workspace_buffer,
+                rows,
+                attn_inputs.kv_cache_kernel_block_id.size(1),
+            )
         # Snapshot of the page indptr used by the last CUDA-core graph plan.
         # Dtype, head counts, and page size are fixed for this op's lifetime.
         self._cuda_core_plan_page_indptr_h: Optional[torch.Tensor] = None
@@ -1089,6 +1200,17 @@ class PyFlashinferDecodeAttnOp(object):
         return (
             self._tensor_core_cuda_graph_needs_replan()
             or self._cuda_core_cuda_graph_needs_replan()
+        )
+
+    def _plan_cascade_graph(self) -> None:
+        self.cascade_graph.plan(
+            self.fmha_params.decode_page_indptr_h,
+            self.fmha_params.page_indice_h,
+            self.fmha_params.paged_kv_last_page_len_h,
+            self.local_head_num,
+            self.local_kv_head_num,
+            self.head_dim_qk,
+            self.seq_size_per_block,
         )
 
     def _plan_decode_wrapper(self, attn_inputs: PyAttentionInputs) -> None:
@@ -1183,6 +1305,10 @@ class PyFlashinferDecodeAttnOp(object):
                 forbid_realloc=forbid_realloc,
             )
 
+        if self.cascade_graph is not None:
+            self._plan_cascade_graph()
+            return self.fmha_params
+
         if self.enable_cuda_graph and self.decode_wrapper._fixed_batch_size == 0:
             batch_size = attn_inputs.input_lengths.size(0)
             self.decode_wrapper._use_cuda_graph = True
@@ -1208,7 +1334,7 @@ class PyFlashinferDecodeAttnOp(object):
 
     def prepare_for_cuda_graph_replay(self, attn_inputs: PyAttentionInputs) -> None:
         """Refresh FlashInfer runtime buffers before replaying the captured graph."""
-        if not attn_inputs.sequence_lengths.is_cuda:
+        if self.cascade_graph is not None or not attn_inputs.sequence_lengths.is_cuda:
             # Host pipeline: refresh the host mirrors and re-plan when the
             # selected backend's cached metadata no longer matches them.
             block_id_host = attn_inputs.kv_cache_kernel_block_id
@@ -1222,7 +1348,9 @@ class PyFlashinferDecodeAttnOp(object):
                 self.seq_size_per_block,
                 forbid_realloc=True,
             )
-            if self._cuda_graph_replay_needs_replan():
+            if self.cascade_graph is not None:
+                self._plan_cascade_graph()
+            elif self._cuda_graph_replay_needs_replan():
                 self._plan_decode_wrapper(attn_inputs)
             return
 
@@ -1264,6 +1392,8 @@ class PyFlashinferDecodeAttnOp(object):
                 self.head_dim_qk,
             )
         # Decode FP8 defaults to unit scales and the output dtype from plan().
+        if self.cascade_graph is not None:
+            return self.cascade_graph.run(q, paged_kv_cache)
         return self.decode_wrapper.run(q, paged_kv_cache)
 
 
