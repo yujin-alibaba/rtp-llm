@@ -1024,7 +1024,10 @@ def determine_use_tensor_core_from_configs(attn_configs: AttentionConfigs) -> bo
 class RqCascadeDecodeGraph:
     """Run shared-prefix FA2 and Paged Decode tail in a fixed Decode Graph bucket."""
 
-    group_size = 32
+    # RQ's 100/200-beam Decode steps end on a group boundary before
+    # graph bucket padding. Keeping the group size fixed preserves the
+    # FA2 query layout and plan reuse across graph replays.
+    group_size = 20
     min_prefix_pages = 4
 
     def __init__(self, workspace, rows, max_pages):
