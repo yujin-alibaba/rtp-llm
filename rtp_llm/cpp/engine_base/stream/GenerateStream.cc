@@ -17,6 +17,7 @@
 #include "rtp_llm/cpp/config/ModelConfig.h"
 #include "rtp_llm/cpp/models/logits_processor/LogitsProcessorFactory.h"
 #include "rtp_llm/cpp/models/logits_processor/MultiSeqLogitsProcessor.h"
+#include "rtp_llm/cpp/models/logits_processor/RqCsrLogitsProcessor.h"
 #include "rtp_llm/cpp/utils/LinearBlocksUtil.h"
 
 using namespace std;
@@ -147,14 +148,16 @@ GenerateStream::GenerateStream(const shared_ptr<GenerateInput>& input,
     }
 
     auto processors_result = LogitsProcessorFactory::createLogitsProcessors(
-        generate_input_, logits_processor_init_batch_size, maxBatchSize(), processor_eos_token_id);
+        generate_input_, logits_processor_init_batch_size, maxBatchSize(), processor_eos_token_id,
+        model_config.output_vocab_ids);
     if (processors_result.ok()) {
         auto processors = std::move(processors_result.value());
         if (output_vocab_size_ > 0) {
             for (const auto& processor : processors) {
-                if (typeid(*processor) != typeid(MultiSeqLogitsProcessor)) {
+                if (typeid(*processor) != typeid(MultiSeqLogitsProcessor)
+                    && typeid(*processor) != typeid(RqCsrLogitsProcessor)) {
                     reportError(ErrorCode::INVALID_PARAMS,
-                                "output vocabulary pruning only supports the MultiSeq logits processor");
+                                "output vocabulary pruning only supports MultiSeq and explicitly enabled compact CSR processors");
                     return;
                 }
             }

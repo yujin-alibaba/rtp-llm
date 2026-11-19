@@ -23,7 +23,8 @@ public:
     createLogitsProcessors(std::shared_ptr<GenerateInput> generate_input,
                            int32_t                        init_batch_size,
                            int32_t                        max_batch_size,
-                           int64_t                        eos_token_id);
+                           int64_t                        eos_token_id,
+                           const std::vector<int64_t>&     output_vocab_ids = {});
 
 private:
     static std::shared_ptr<XGrammarBackend>& grammarBackend();

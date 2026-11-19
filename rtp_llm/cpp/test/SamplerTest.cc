@@ -2,6 +2,7 @@
 #include "rtp_llm/cpp/models/Sampler.h"
 #include "rtp_llm/cpp/models/logits_processor/RqCsrLogitsProcessor.h"
 #include "rtp_llm/cpp/test/ModelTestUtil.h"
+#include <cstdlib>
 
 using namespace std;
 using namespace rtp_llm;
@@ -144,6 +145,72 @@ TEST_F(SamplerTest, RqPackedAndFlatSupplyOverrideStringSupply) {
     EXPECT_EQ(inputs.logits.isfinite().sum().item<int64_t>(), 1);
     config.extra_info.clear();
     EXPECT_FALSE(RqCsrLogitsProcessor::create(config).ok());
+}
+
+namespace {
+// Restore environment even when ASSERT_* returns early. These CPU processor tests
+// do not initialize Sampler's process-lifetime normalization flag.
+class CompactCsrEnvGuard {
+public:
+    CompactCsrEnvGuard(): old_enable_(getenv("RQ_COMPACT_CSR") ? getenv("RQ_COMPACT_CSR") : ""),
+                         old_masked_(getenv("RQ_LEGACY_MASKED_NORMALIZATION") ? getenv("RQ_LEGACY_MASKED_NORMALIZATION") : ""),
+                         had_enable_(getenv("RQ_COMPACT_CSR") != nullptr),
+                         had_masked_(getenv("RQ_LEGACY_MASKED_NORMALIZATION") != nullptr) {}
+    ~CompactCsrEnvGuard() {
+        if (had_enable_) setenv("RQ_COMPACT_CSR", old_enable_.c_str(), 1); else unsetenv("RQ_COMPACT_CSR");
+        if (had_masked_) setenv("RQ_LEGACY_MASKED_NORMALIZATION", old_masked_.c_str(), 1); else unsetenv("RQ_LEGACY_MASKED_NORMALIZATION");
+    }
+private:
+    std::string old_enable_, old_masked_;
+    bool had_enable_, had_masked_;
+};
+}  // namespace
+
+TEST_F(SamplerTest, RqCompactCsrRequiresOptInMaskedNormalizationAndCompleteVocabulary) {
+    CompactCsrEnvGuard guard;
+    GenerateConfig config;
+    config.ele_rq_ids = {"100_1000_9000"};
+    unsetenv("RQ_COMPACT_CSR");
+    setenv("RQ_LEGACY_MASKED_NORMALIZATION", "1", 1);
+    EXPECT_FALSE(RqCsrLogitsProcessor::create(config, {100, 1000, 9000}).ok());
+    setenv("RQ_COMPACT_CSR", "1", 1);
+    unsetenv("RQ_LEGACY_MASKED_NORMALIZATION");
+    EXPECT_FALSE(RqCsrLogitsProcessor::create(config, {100, 1000, 9000}).ok());
+    setenv("RQ_LEGACY_MASKED_NORMALIZATION", "1", 1);
+    EXPECT_FALSE(RqCsrLogitsProcessor::create(config, {100, 1000}).ok());
+    EXPECT_FALSE(RqCsrLogitsProcessor::create(config, {1000, 100, 9000}).ok());
+    EXPECT_TRUE(RqCsrLogitsProcessor::create(config, {100, 1000, 9000}).ok());
+    EXPECT_TRUE(RqCsrLogitsProcessor::create(config).ok());  // Default canonical path unchanged.
+}
+
+TEST_F(SamplerTest, RqCompactCsrPreservesCanonicalPrefixAndMaskedScores) {
+    CompactCsrEnvGuard guard;
+    setenv("RQ_COMPACT_CSR", "1", 1);
+    setenv("RQ_LEGACY_MASKED_NORMALIZATION", "1", 1);
+    GenerateConfig config;
+    config.ele_rq_ids = {"100_1000_9000", "100_1000_9001"};
+    auto full = RqCsrLogitsProcessor::create(config);
+    auto compact = RqCsrLogitsProcessor::create(config, {100, 1000, 9000, 9001});
+    ASSERT_TRUE(full.ok());
+    ASSERT_TRUE(compact.ok());
+    SamplerInputs a{}, b{};
+    a.token_ids = torch::tensor({{7, 100, 1000, 0}}, torch::kInt32);
+    a.input_lengths = torch::ones({1}, torch::kInt32);
+    b.token_ids = a.token_ids;
+    b.input_lengths = a.input_lengths;
+    auto columns = torch::tensor({100, 1000, 9000, 9001}, torch::kInt64);
+    for (int step = 1; step <= 3; ++step) {
+        a.sequence_lengths = torch::full({1}, step, torch::kInt32);
+        b.sequence_lengths = a.sequence_lengths;
+        a.logits = torch::arange(9002, torch::kFloat32).reshape({1, 9002}) / 1000;
+        b.logits = a.logits.index_select(1, columns).clone();
+        ASSERT_FALSE(full.value()->process(a, 0, 1).has_value());
+        ASSERT_FALSE(compact.value()->process(b, 0, 1).has_value());
+        EXPECT_TRUE(torch::equal(a.logits.index_select(1, columns), b.logits));
+        EXPECT_TRUE(torch::allclose(a.logits.log_softmax(-1).index_select(1, columns),
+                                    b.logits.log_softmax(-1), 1e-6, 1e-6));
+        EXPECT_EQ(b.logits.isfinite().sum().item<int64_t>(), step == 3 ? 2 : 1);
+    }
 }
 
 TEST_F(SamplerTest, RqMixedGreedyAndRandomUseFullVocabularyScores) {

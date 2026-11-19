@@ -86,7 +86,8 @@ ErrorResult<std::vector<BaseLogitsProcessorPtr>>
 LogitsProcessorFactory::createLogitsProcessors(std::shared_ptr<GenerateInput> generate_input,
                                                int32_t                        init_batch_size,
                                                int32_t                        max_batch_size,
-                                               int64_t                        eos_token_id) {
+                                               int64_t                        eos_token_id,
+                                               const std::vector<int64_t>&     output_vocab_ids) {
     std::vector<BaseLogitsProcessorPtr> result;
 
     auto& config = *generate_input->generate_config;
@@ -144,7 +145,7 @@ LogitsProcessorFactory::createLogitsProcessors(std::shared_ptr<GenerateInput> ge
         if (!config.hasNumBeams() && config.num_return_sequences > 1) {
             return ErrorInfo(ErrorCode::INVALID_PARAMS, "RQ supply requires beam search or one return sequence");
         }
-        auto csr = RqCsrLogitsProcessor::create(config);
+        auto csr = RqCsrLogitsProcessor::create(config, output_vocab_ids);
         if (!csr.ok()) {
             return csr.status();
         }
